@@ -20,30 +20,26 @@ The first commit keeps external systems behind local interfaces:
 
 ## ADK Graph
 
-The current ADK graph is built in `internal/agent/graph.go` with ADK workflow agents:
+The current ADK graph is built in `internal/agent/graph.go` with the official ADK v2 workflow API:
 
-```text
-voice_agent_graph  // sequentialagent
-  -> memory_context  // ADK MemoryService context load boundary
-  -> dialogue        // main LLM agent placeholder
-  -> memory_commit   // completed turn/session memory write boundary
+```go
+memoryContext := workflow.NewFunctionNode("memory_context", memoryContextFn, nodeConfig)
+dialogue := workflow.NewFunctionNode("dialogue", dialogueFn, nodeConfig)
+memoryCommit := workflow.NewFunctionNode("memory_commit", memoryCommitFn, nodeConfig)
+
+edges := workflow.Chain(workflow.Start, memoryContext, dialogue, memoryCommit)
+root, err := workflowagent.New(workflowagent.Config{
+    Name:  "voice_agent_graph",
+    Edges: edges,
+})
 ```
 
-In ADK Go there is no explicit `AddEdge(from, to)` API for this workflow shape. The edges are implied by the agent type and child order:
-
-- `sequentialagent.New(...)` defines sequential execution semantics.
-- `agent.Config.SubAgents` defines the ordered child list.
-- The execution edges are therefore `memory_context -> dialogue -> memory_commit`.
-- `google.golang.org/adk/memory.Service` provides the long-term memory boundary.
-
-For readability, `internal/agent/graph.go` also keeps an explicit local edge list:
+The workflow edges are:
 
 ```text
-voice_agent_graph -> memory_context (contains)
-voice_agent_graph -> dialogue (contains)
-voice_agent_graph -> memory_commit (contains)
-memory_context -> dialogue (sequential_next)
-dialogue -> memory_commit (sequential_next)
+START -> memory_context
+memory_context -> dialogue
+dialogue -> memory_commit
 ```
 
 The next concrete replacement is:

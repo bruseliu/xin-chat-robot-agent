@@ -2,112 +2,64 @@ package agent
 
 import (
 	"fmt"
-	"iter"
 
-	adkagent "google.golang.org/adk/agent"
-	"google.golang.org/adk/agent/workflowagents/sequentialagent"
-	"google.golang.org/adk/model"
-	"google.golang.org/adk/session"
-	"google.golang.org/genai"
+	adkagent "google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/agent/workflowagent"
+	"google.golang.org/adk/v2/workflow"
 )
 
 type GraphConfig struct {
 	AgentID string
 }
 
-type Edge struct {
-	From string
-	To   string
-	Kind string
-}
-
 type Graph struct {
 	Root  adkagent.Agent
-	Edges []Edge
+	Edges []workflow.Edge
 }
 
 func NewGraph(cfg GraphConfig) (*Graph, error) {
-	memoryContext, err := newGraphNode(
+	nodeConfig := workflow.NodeConfig{
+		RetryConfig: workflow.DefaultRetryConfig(),
+	}
+
+	memoryContext := workflow.NewFunctionNode(
 		"memory_context",
-		"Loads long-term user memory through ADK MemoryService before the dialogue agent runs.",
-		"memory_context node: ADK MemoryService is available to downstream agents.",
+		func(ctx adkagent.Context, input string) (string, error) {
+			return "memory_context node: ADK MemoryService is available to downstream agents.", nil
+		},
+		nodeConfig,
 	)
-	if err != nil {
-		return nil, err
-	}
-
-	dialogue, err := newGraphNode(
+	dialogue := workflow.NewFunctionNode(
 		"dialogue",
-		"Main conversational agent. This will be replaced by llmagent.New with model and tools.",
-		"dialogue node: placeholder response from the ADK graph.",
+		func(ctx adkagent.Context, input string) (string, error) {
+			return "dialogue node: placeholder response from the ADK workflow graph.", nil
+		},
+		nodeConfig,
 	)
-	if err != nil {
-		return nil, err
-	}
-
-	memoryCommit, err := newGraphNode(
+	memoryCommit := workflow.NewFunctionNode(
 		"memory_commit",
-		"Commits the completed turn/session back to long-term memory.",
-		"memory_commit node: completed turn is ready for async memory write.",
+		func(ctx adkagent.Context, input string) (string, error) {
+			return "memory_commit node: completed turn is ready for async memory write.", nil
+		},
+		nodeConfig,
 	)
-	if err != nil {
-		return nil, err
-	}
 
 	rootName := cfg.AgentID
 	if rootName == "" {
 		rootName = "voice_agent_graph"
 	}
 
-	root, err := sequentialagent.New(sequentialagent.Config{
-		AgentConfig: adkagent.Config{
-			Name:        rootName,
-			Description: "Voice chatbot ADK graph: memory_context -> dialogue -> memory_commit.",
-			SubAgents: []adkagent.Agent{
-				memoryContext,
-				dialogue,
-				memoryCommit,
-			},
-		},
+	edges := workflow.Chain(workflow.Start, memoryContext, dialogue, memoryCommit)
+	root, err := workflowagent.New(workflowagent.Config{
+		Name:        rootName,
+		Description: "Voice chatbot ADK workflow graph: memory_context -> dialogue -> memory_commit.",
+		Edges:       edges,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create ADK graph: %w", err)
+		return nil, fmt.Errorf("create ADK workflow graph: %w", err)
 	}
 
-	return &Graph{
-		Root: root,
-		Edges: []Edge{
-			{From: rootName, To: "memory_context", Kind: "contains"},
-			{From: rootName, To: "dialogue", Kind: "contains"},
-			{From: rootName, To: "memory_commit", Kind: "contains"},
-			{From: "memory_context", To: "dialogue", Kind: "sequential_next"},
-			{From: "dialogue", To: "memory_commit", Kind: "sequential_next"},
-		},
-	}, nil
-}
-
-func newGraphNode(name, description, output string) (adkagent.Agent, error) {
-	node, err := adkagent.New(adkagent.Config{
-		Name:        name,
-		Description: description,
-		Run: func(ctx adkagent.InvocationContext) iter.Seq2[*session.Event, error] {
-			return func(yield func(*session.Event, error) bool) {
-				yield(&session.Event{
-					Author: name,
-					LLMResponse: model.LLMResponse{
-						Content: genai.NewContentFromText(output, genai.RoleModel),
-						CustomMetadata: map[string]any{
-							"graph_node": name,
-						},
-					},
-				}, nil)
-			}
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create graph node %s: %w", name, err)
-	}
-	return node, nil
+	return &Graph{Root: root, Edges: edges}, nil
 }
 
 func DescribeGraph(root adkagent.Agent) []string {
@@ -121,10 +73,14 @@ func DescribeGraph(root adkagent.Agent) []string {
 	return lines
 }
 
-func DescribeEdges(edges []Edge) []string {
+func DescribeEdges(edges []workflow.Edge) []string {
 	lines := make([]string, 0, len(edges))
 	for _, edge := range edges {
-		lines = append(lines, edge.From+" -> "+edge.To+" ("+edge.Kind+")")
+		if edge.Route == nil {
+			lines = append(lines, edge.From.Name()+" -> "+edge.To.Name())
+			continue
+		}
+		lines = append(lines, edge.From.Name()+" -> "+edge.To.Name()+" (route)")
 	}
 	return lines
 }

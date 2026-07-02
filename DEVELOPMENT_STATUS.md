@@ -74,49 +74,33 @@ Source checked:
 
 ### ADK Graph Skeleton
 
-Implemented in `internal/agent/graph.go`.
+Implemented in `internal/agent/graph.go` with the official ADK v2 workflow API.
 
-Current ADK graph:
+Current ADK workflow graph:
 
 ```text
-voice-agent
-  -> memory_context
-  -> dialogue
-  -> memory_commit
+START -> memory_context -> dialogue -> memory_commit
 ```
 
 This is built with:
 
 ```go
-sequentialagent.New(sequentialagent.Config{
-    AgentConfig: agent.Config{
-        SubAgents: []agent.Agent{
-            memoryContext,
-            dialogue,
-            memoryCommit,
-        },
-    },
+memoryContext := workflow.NewFunctionNode("memory_context", memoryContextFn, nodeConfig)
+dialogue := workflow.NewFunctionNode("dialogue", dialogueFn, nodeConfig)
+memoryCommit := workflow.NewFunctionNode("memory_commit", memoryCommitFn, nodeConfig)
+
+edges := workflow.Chain(workflow.Start, memoryContext, dialogue, memoryCommit)
+root, err := workflowagent.New(workflowagent.Config{
+    Name:  rootName,
+    Edges: edges,
 })
 ```
 
-ADK Go does not expose an `AddEdge(from, to)` API for this workflow shape. The execution order is defined by `sequentialagent` plus the ordered `SubAgents` list.
-
 Source checked:
 
-- `/home/liuxin/go/pkg/mod/google.golang.org/adk@v1.5.0/agent/agent.go`
-- `/home/liuxin/go/pkg/mod/google.golang.org/adk@v1.5.0/agent/workflowagents/sequentialagent/agent.go`
-
-For readability, the project also keeps a local explicit edge list:
-
-```text
-voice-agent -> memory_context (contains)
-voice-agent -> dialogue (contains)
-voice-agent -> memory_commit (contains)
-memory_context -> dialogue (sequential_next)
-dialogue -> memory_commit (sequential_next)
-```
-
-This local edge list is descriptive only. ADK execution still comes from `sequentialagent` and `SubAgents`.
+- `/home/liuxin/go/pkg/mod/google.golang.org/adk/v2@v2.0.0/workflow/function_node.go`
+- `/home/liuxin/go/pkg/mod/google.golang.org/adk/v2@v2.0.0/workflow/edgebuilder.go`
+- `/home/liuxin/go/pkg/mod/google.golang.org/adk/v2@v2.0.0/agent/workflowagent/workflow.go`
 
 ## Important Limitation
 

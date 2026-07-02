@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	google.golang.org/adk v1.5.0
+	google.golang.org/adk/v2 v2.0.0
 	google.golang.org/genai v1.62.0
 )
 
