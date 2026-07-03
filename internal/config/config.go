@@ -11,6 +11,12 @@ type Config struct {
 	Env     string
 	AgentID string
 	Mem0    Mem0Config
+	Session SessionConfig
+}
+
+type SessionConfig struct {
+	PostgresDSN string
+	AutoMigrate bool
 }
 
 type Mem0Config struct {
@@ -26,6 +32,10 @@ func Load() Config {
 		Addr:    envString("APP_ADDR", ":8080"),
 		Env:     envString("APP_ENV", "local"),
 		AgentID: envString("AGENT_ID", "voice-agent"),
+		Session: SessionConfig{
+			PostgresDSN: envString("ADK_SESSION_POSTGRES_DSN", ""),
+			AutoMigrate: envBool("ADK_SESSION_AUTO_MIGRATE", true),
+		},
 		Mem0: Mem0Config{
 			Mode:    envString("MEM0_MODE", "self_hosted"),
 			BaseURL: envString("MEM0_BASE_URL", "http://localhost:8888"),
@@ -49,6 +59,18 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func envBool(key string, fallback bool) bool {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseBool(raw)
 	if err != nil {
 		return fallback
 	}

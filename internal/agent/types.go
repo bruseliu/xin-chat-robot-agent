@@ -7,10 +7,15 @@ import (
 	"strings"
 
 	"xin-chat-robot-agent/internal/memory"
+
+	adkmemory "google.golang.org/adk/v2/memory"
+	adksession "google.golang.org/adk/v2/session"
 )
 
 type Config struct {
-	AgentID string
+	AgentID        string
+	SessionService adksession.Service
+	MemoryService  adkmemory.Service
 }
 
 type TurnInput struct {
@@ -53,7 +58,7 @@ func (r *ADKRunner) RunTurn(ctx context.Context, input TurnInput) (TurnOutput, e
 	if strings.TrimSpace(input.Text) == "" {
 		return TurnOutput{}, fmt.Errorf("empty input text")
 	}
-	r.logger.Info("agent turn", "agent_id", r.cfg.AgentID, "user_id", input.UserID, "memory_count", len(input.Memories))
+	r.logger.Info("agent turn", "agent_id", r.cfg.AgentID, "user_id", input.UserID, "memory_count", len(input.Memories), "adk_session_service", r.cfg.SessionService != nil, "adk_memory_service", r.cfg.MemoryService != nil)
 	return r.planner.Plan(ctx, input)
 }
 

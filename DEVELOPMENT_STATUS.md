@@ -3,11 +3,11 @@
 ## Current Stack Decision
 
 - Language: Go
-- Agent framework: ADK Go package, `google.golang.org/adk`
+- Agent framework: ADK Go package, `google.golang.org/adk/v2`
 - Long-term memory: mem0
 - Current service entry: `cmd/server/main.go`
 
-Note: the installed ADK Go module version is `google.golang.org/adk v1.5.0`. This is the Go module version currently resolved by `go list`; it does not appear as a `v2.x` Go module.
+Note: the project now resolves `google.golang.org/adk/v2 v2.0.0`.
 
 ## Completed
 
@@ -57,7 +57,7 @@ This keeps the voice pipeline and agent logic independent of mem0 deployment det
 
 Implemented in `internal/memory/adk_service.go`.
 
-`NewADKService(...)` returns `google.golang.org/adk/memory.Service`.
+`NewADKService(...)` returns `google.golang.org/adk/v2/memory.Service`.
 
 This matches the ADK source interface:
 
@@ -70,7 +70,30 @@ type Service interface {
 
 Source checked:
 
-- `/home/liuxin/go/pkg/mod/google.golang.org/adk@v1.5.0/memory/service.go`
+- `/home/liuxin/go/pkg/mod/google.golang.org/adk/v2@v2.0.0/memory/service.go`
+
+### ADK SessionService Storage
+
+Implemented in `internal/sessionstore/postgres.go`.
+
+The configured ADK session backend is the official ADK v2 `session/database` service with a PostgreSQL GORM dialector. Startup constructs it from `ADK_SESSION_POSTGRES_DSN` and optionally runs `database.AutoMigrate(...)` when `ADK_SESSION_AUTO_MIGRATE=true`.
+
+Use it as the runner session service:
+
+```go
+sessionSvc, err := sessionstore.NewPostgresService(sessionstore.PostgresConfig{
+    DSN:         cfg.Session.PostgresDSN,
+    AutoMigrate: cfg.Session.AutoMigrate,
+})
+
+runner.Config{
+    Agent:          graph.Root,
+    SessionService: sessionSvc,
+    MemoryService:  memory.NewADKService(...),
+}
+```
+
+This moves complete ADK session events out of Go process memory and into PostgreSQL. The optional `ManagedService` wrapper in `internal/sessionstore/managed.go` remains available for active-window experiments, but the main architecture is PostgreSQL-backed SessionService plus mem0-backed MemoryService.
 
 ### ADK Graph Skeleton
 
@@ -79,22 +102,38 @@ Implemented in `internal/agent/graph.go` with the official ADK v2 workflow API.
 Current ADK workflow graph:
 
 ```text
-START -> memory_context -> dialogue -> memory_commit
+START -> asr -> memory_context -> llm -> memory_commit -> tts
 ```
 
 This is built with:
 
 ```go
+asr := workflow.NewFunctionNode("asr", asrFn, nodeConfig)
 memoryContext := workflow.NewFunctionNode("memory_context", memoryContextFn, nodeConfig)
-dialogue := workflow.NewFunctionNode("dialogue", dialogueFn, nodeConfig)
+llm := workflow.NewFunctionNode("llm", llmFn, nodeConfig)
 memoryCommit := workflow.NewFunctionNode("memory_commit", memoryCommitFn, nodeConfig)
+tts := workflow.NewFunctionNode("tts", ttsFn, nodeConfig)
 
-edges := workflow.Chain(workflow.Start, memoryContext, dialogue, memoryCommit)
+edges := workflow.Chain(workflow.Start, asr, memoryContext, llm, memoryCommit, tts)
 root, err := workflowagent.New(workflowagent.Config{
     Name:  rootName,
     Edges: edges,
 })
 ```
+
+`memory_context` calls ADK v2 `ctx.SearchMemory(...)` and converts the mem0-backed results into the `LLMInput` passed to the `llm` node. Search policy remains centralized in `internal/memory`:
+
+- `Mem0Client.Search(...)` applies identity filters and `topK`.
+- `NewADKService(...)` adapts the local mem0 store to ADK v2 `memory.Service`.
+- Search failures degrade to an empty memory list so the turn can continue.
+
+Node payloads are text-first but attachment-compatible:
+
+- `TurnContext` carries current turn text and optional `AttachmentRef` values.
+- `LLMInput` carries text, long-term memories, and optional attachment refs.
+- `LLMOutput` and `TTSOutput` keep response text separate from future blob refs.
+
+Current image memory storage is intentionally out of scope. Future blob storage can be added behind an object-store interface and represented in workflow payloads through `AttachmentRef`.
 
 Source checked:
 
@@ -106,13 +145,15 @@ Source checked:
 
 The current ADK graph is a skeleton, not the final production graph.
 
-The three graph nodes are currently custom placeholder agents:
+The workflow nodes are currently placeholder function nodes:
 
+- `asr`
 - `memory_context`
-- `dialogue`
+- `llm`
 - `memory_commit`
+- `tts`
 
-They are real ADK `agent.Agent` objects, but they do not yet execute the full LLM workflow.
+They are real ADK v2 workflow nodes, but they do not yet call the production ASR, LLM, memory, or TTS adapters.
 
 The main `/v1/chat/text` path still uses the local `ADKRunner` placeholder in `internal/agent/types.go`, not a fully wired ADK `runner.Run(...)` invocation.
 
@@ -134,14 +175,14 @@ The final runner should pass:
 ```go
 runner.Config{
     Agent:          graph.Root,
-    SessionService: session.InMemoryService() or persistent implementation,
+    SessionService: sessionstore.NewPostgresService(...),
     MemoryService:  memory.NewADKService(...),
 }
 ```
 
 ### Real Dialogue Agent
 
-The `dialogue` placeholder should be replaced with `llmagent.New(...)`.
+The `llm` placeholder should be replaced with `llmagent.New(...)` or another model-backed ADK node.
 
 Expected responsibilities:
 
@@ -166,13 +207,13 @@ Current implemented endpoint is text-only for smoke testing.
 
 Still needed:
 
-- Redis or in-memory session state for active audio turns
-- Postgres event log for durable conversation history
+- Tune PostgreSQL indexes/retention once production event volume is known
+- Optional Postgres event log for durable conversation history and event-level compaction
 - Optional object storage for raw audio
 
 ### Tests
 
-Current verification is compile/smoke level:
+Current verification is compile/smoke level plus focused session wrapper unit tests:
 
 ```bash
 go test ./...
@@ -213,8 +254,9 @@ curl --noproxy '*' -X POST http://127.0.0.1:8080/v1/chat/text \
 
 Replace the placeholder local `ADKRunner` with a real ADK runner path:
 
-1. Create a real `dialogue` node with `llmagent.New(...)`.
+1. Replace the `llm` placeholder with `llmagent.New(...)` or a model-backed workflow node.
 2. Create a `runner.Runner` with `runner.New(...)`.
-3. Attach `NewADKService(mem0Client, agentID, topK)` as `runner.Config.MemoryService`.
-4. Convert `/v1/chat/text` to call `runner.Run(...)`.
-5. Extract final assistant text from emitted ADK `session.Event` values.
+3. Attach the configured PostgreSQL-backed `session.Service` as `runner.Config.SessionService`.
+4. Attach `NewADKService(mem0Client, agentID, topK)` as `runner.Config.MemoryService`.
+5. Convert `/v1/chat/text` to call `runner.Run(...)`.
+6. Extract final assistant text from emitted ADK `session.Event` values.

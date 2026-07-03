@@ -13,6 +13,7 @@ import (
 	"xin-chat-robot-agent/internal/api"
 	"xin-chat-robot-agent/internal/config"
 	"xin-chat-robot-agent/internal/memory"
+	"xin-chat-robot-agent/internal/sessionstore"
 	"xin-chat-robot-agent/internal/voice"
 )
 
@@ -30,6 +31,16 @@ func main() {
 		Timeout: cfg.Mem0.Timeout,
 	}, logger)
 
+	sessionService, err := sessionstore.NewPostgresService(sessionstore.PostgresConfig{
+		DSN:         cfg.Session.PostgresDSN,
+		AutoMigrate: cfg.Session.AutoMigrate,
+	})
+	if err != nil {
+		logger.Error("create ADK session service failed", "error", err)
+		os.Exit(1)
+	}
+	adkMemoryService := memory.NewADKService(memClient, cfg.AgentID, cfg.Mem0.TopK)
+
 	graph, err := agent.NewGraph(agent.GraphConfig{AgentID: cfg.AgentID})
 	if err != nil {
 		logger.Error("create ADK graph failed", "error", err)
@@ -43,7 +54,9 @@ func main() {
 	}
 
 	agentRunner := agent.NewADKRunner(agent.Config{
-		AgentID: cfg.AgentID,
+		AgentID:        cfg.AgentID,
+		SessionService: sessionService,
+		MemoryService:  adkMemoryService,
 	}, memClient, logger)
 
 	pipeline := voice.NewPipeline(agentRunner, memClient, logger)
