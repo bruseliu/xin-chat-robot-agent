@@ -41,7 +41,20 @@ func main() {
 	}
 	adkMemoryService := memory.NewADKService(memClient, cfg.AgentID, cfg.Mem0.TopK)
 
-	graph, err := agent.NewGraph(agent.GraphConfig{AgentID: cfg.AgentID})
+	vadDetector, err := newVADDetector(cfg.VAD)
+	if err != nil {
+		logger.Error("create VAD detector failed", "error", err)
+		os.Exit(1)
+	}
+	if vadDetector != nil {
+		defer func() {
+			if err := vadDetector.Close(); err != nil {
+				logger.Warn("close VAD detector failed", "error", err)
+			}
+		}()
+	}
+
+	graph, err := agent.NewGraph(agent.GraphConfig{AgentID: cfg.AgentID, VAD: vadDetector})
 	if err != nil {
 		logger.Error("create ADK graph failed", "error", err)
 		os.Exit(1)

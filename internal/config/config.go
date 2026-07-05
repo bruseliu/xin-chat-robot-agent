@@ -12,6 +12,7 @@ type Config struct {
 	AgentID string
 	Mem0    Mem0Config
 	Session SessionConfig
+	VAD     VADConfig
 }
 
 type SessionConfig struct {
@@ -25,6 +26,15 @@ type Mem0Config struct {
 	APIKey  string
 	TopK    int
 	Timeout time.Duration
+}
+
+type VADConfig struct {
+	Provider             string
+	SileroModelPath      string
+	SampleRate           int
+	Threshold            float32
+	MinSilenceDurationMs int
+	SpeechPadMs          int
 }
 
 func Load() Config {
@@ -42,6 +52,14 @@ func Load() Config {
 			APIKey:  envString("MEM0_API_KEY", ""),
 			TopK:    envInt("MEM0_TOP_K", 8),
 			Timeout: time.Duration(envInt("MEM0_TIMEOUT_SECONDS", 10)) * time.Second,
+		},
+		VAD: VADConfig{
+			Provider:             envString("VAD_PROVIDER", "none"),
+			SileroModelPath:      envString("SILERO_VAD_MODEL_PATH", ""),
+			SampleRate:           envInt("VAD_SAMPLE_RATE", 16000),
+			Threshold:            envFloat32("VAD_THRESHOLD", 0.5),
+			MinSilenceDurationMs: envInt("VAD_MIN_SILENCE_MS", 200),
+			SpeechPadMs:          envInt("VAD_SPEECH_PAD_MS", 30),
 		},
 	}
 }
@@ -75,4 +93,16 @@ func envBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return value
+}
+
+func envFloat32(key string, fallback float32) float32 {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseFloat(raw, 32)
+	if err != nil {
+		return fallback
+	}
+	return float32(value)
 }

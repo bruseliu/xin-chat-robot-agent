@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"strings"
+
+	"xin-chat-robot-agent/internal/vad"
 
 	adkagent "google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/workflowagent"
@@ -13,6 +16,7 @@ import (
 
 type GraphConfig struct {
 	AgentID string
+	VAD     vad.StreamingDetector
 }
 
 type Graph struct {
@@ -60,6 +64,13 @@ func NewGraph(cfg GraphConfig) (*Graph, error) {
 		RetryConfig: workflow.DefaultRetryConfig(),
 	}
 
+	vadNode := workflow.NewFunctionNode(
+		"vad",
+		func(ctx adkagent.Context, input any) (any, error) {
+			return runVAD(ctx, cfg.VAD, input)
+		},
+		nodeConfig,
+	)
 	asr := workflow.NewFunctionNode(
 		"asr",
 		func(ctx adkagent.Context, input any) (TurnContext, error) {
@@ -91,8 +102,9 @@ func NewGraph(cfg GraphConfig) (*Graph, error) {
 	)
 	memoryCommit := workflow.NewFunctionNode(
 		"memory_commit",
-		func(ctx adkagent.Context, output LLMOutput) (LLMOutput, error) {
-			return output, nil
+		func(ctx adkagent.Context, output LLMOutput) (any, error) {
+			// Side-effect node: future memory writes should not gate or compete with TTS output.
+			return nil, nil
 		},
 		nodeConfig,
 	)
@@ -109,10 +121,16 @@ func NewGraph(cfg GraphConfig) (*Graph, error) {
 		rootName = "voice_agent_graph"
 	}
 
-	edges := workflow.Chain(workflow.Start, asr, memoryContext, llm, memoryCommit, tts)
+	edges := workflow.Concat(
+		workflow.Chain(workflow.Start, vadNode, asr, memoryContext, llm),
+		[]workflow.Edge{
+			{From: llm, To: memoryCommit},
+			{From: llm, To: tts},
+		},
+	)
 	root, err := workflowagent.New(workflowagent.Config{
 		Name:        rootName,
-		Description: "Voice chatbot ADK workflow graph: ASR -> memory_context -> LLM -> memory_commit -> TTS.",
+		Description: "Voice chatbot ADK workflow graph: VAD -> ASR -> memory_context -> LLM fan-out to memory_commit and TTS.",
 		Edges:       edges,
 	})
 	if err != nil {
@@ -120,6 +138,23 @@ func NewGraph(cfg GraphConfig) (*Graph, error) {
 	}
 
 	return &Graph{Root: root, Edges: edges}, nil
+}
+
+func runVAD(ctx context.Context, detector vad.StreamingDetector, input any) (any, error) {
+	if detector == nil {
+		return input, nil
+	}
+	switch value := input.(type) {
+	case vad.Chunk:
+		return detector.Process(ctx, value)
+	case *vad.Chunk:
+		if value == nil {
+			return nil, fmt.Errorf("vad input chunk is nil")
+		}
+		return detector.Process(ctx, *value)
+	default:
+		return input, nil
+	}
 }
 
 func normalizeTextInput(input any) string {

@@ -3,6 +3,7 @@ module xin-chat-robot-agent
 go 1.25.0
 
 require (
+	github.com/streamer45/silero-vad-go v0.2.1
 	google.golang.org/adk/v2 v2.0.0
 	google.golang.org/genai v1.62.0
 	gorm.io/driver/postgres v1.6.0
@@ -49,3 +50,5 @@ require (
 	rsc.io/omap v1.2.0 // indirect
 	rsc.io/ordered v1.1.1 // indirect
 )
+
+replace github.com/streamer45/silero-vad-go => ./third_party/silero-vad-go

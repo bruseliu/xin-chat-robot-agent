@@ -102,24 +102,39 @@ Implemented in `internal/agent/graph.go` with the official ADK v2 workflow API.
 Current ADK workflow graph:
 
 ```text
-START -> asr -> memory_context -> llm -> memory_commit -> tts
+START -> vad -> asr -> memory_context -> llm
+llm -> memory_commit
+llm -> tts
 ```
 
 This is built with:
 
 ```go
+vad := workflow.NewFunctionNode("vad", vadFn, nodeConfig)
 asr := workflow.NewFunctionNode("asr", asrFn, nodeConfig)
 memoryContext := workflow.NewFunctionNode("memory_context", memoryContextFn, nodeConfig)
 llm := workflow.NewFunctionNode("llm", llmFn, nodeConfig)
 memoryCommit := workflow.NewFunctionNode("memory_commit", memoryCommitFn, nodeConfig)
 tts := workflow.NewFunctionNode("tts", ttsFn, nodeConfig)
 
-edges := workflow.Chain(workflow.Start, asr, memoryContext, llm, memoryCommit, tts)
+edges := workflow.Concat(
+    workflow.Chain(workflow.Start, vad, asr, memoryContext, llm),
+    []workflow.Edge{
+        {From: llm, To: memoryCommit},
+        {From: llm, To: tts},
+    },
+)
 root, err := workflowagent.New(workflowagent.Config{
     Name:  rootName,
     Edges: edges,
 })
 ```
+
+Workflow entry semantics are now explicitly documented in `README.md`: the first business node is whichever node is connected from `workflow.Start`. The current graph is single-entry because `workflow.Start -> vad`. If the graph later needs multiple entry nodes, represent that as `workflow.Start` fan-out. Every successor of `workflow.Start` receives the initial user input and may run concurrently. Branches that feed one downstream step should be joined deliberately, and terminal outputs must remain unambiguous because ADK errors when multiple terminal nodes produce final output in the same completed run.
+
+`vad` now calls the optional `internal/vad.StreamingDetector` configured on `GraphConfig`. Non-audio input still passes through so the text smoke-test path keeps working. Audio input uses `vad.Chunk`, and detector output is a streaming `vad.Decision`. The Silero adapter is included in the default cgo build using the repo-local ONNX Runtime; `CGO_ENABLED=0` builds cannot use `VAD_PROVIDER=silero`.
+
+The post-LLM graph now fans out: `llm -> memory_commit` and `llm -> tts`. `memory_commit` is intentionally side-effect-only and returns no workflow output, so it can write long-term memory without gating TTS. `tts` is the only terminal branch expected to produce user-facing output.
 
 `memory_context` calls ADK v2 `ctx.SearchMemory(...)` and converts the mem0-backed results into the `LLMInput` passed to the `llm` node. Search policy remains centralized in `internal/memory`:
 
@@ -147,13 +162,14 @@ The current ADK graph is a skeleton, not the final production graph.
 
 The workflow nodes are currently placeholder function nodes:
 
+- `vad`
 - `asr`
 - `memory_context`
 - `llm`
-- `memory_commit`
-- `tts`
+- `memory_commit` side-effect branch
+- `tts` response branch
 
-They are real ADK v2 workflow nodes, but they do not yet call the production ASR, LLM, memory, or TTS adapters.
+They are real ADK v2 workflow nodes. The VAD node has a streaming detector interface and Silero adapter, while ASR, LLM, memory commit, and TTS remain placeholder production integrations.
 
 The main `/v1/chat/text` path still uses the local `ADKRunner` placeholder in `internal/agent/types.go`, not a fully wired ADK `runner.Run(...)` invocation.
 
@@ -190,6 +206,19 @@ Expected responsibilities:
 - Use retrieved memory through ADK memory APIs or preload memory tool
 - Call tools if needed
 - Stream or aggregate assistant response
+
+### Streaming VAD
+
+Implemented in `internal/vad`:
+
+- `StreamingDetector` interface for graph-level injection.
+- `Stream` state machine for chunked VAD decisions.
+- Silero adapter using the repo-local `third_party/silero-vad-go` copy with an exported single-frame `Detector.Infer(...)`, wired through `internal/vad.Stream` for true window-by-window processing without replaying full audio history.
+- Default cgo builds include the real Silero adapter using the repo-local ONNX Runtime at `third_party/onnxruntime/linux-x64-1.18.1` and the repo-local Silero VAD v5 ONNX model; `CGO_ENABLED=0` builds cannot use `VAD_PROVIDER=silero`.
+- Runtime config in `.env.example`: `VAD_PROVIDER`, `SILERO_VAD_MODEL_PATH`, `VAD_SAMPLE_RATE`, `VAD_THRESHOLD`, `VAD_MIN_SILENCE_MS`, and `VAD_SPEECH_PAD_MS`.
+- Unit tests cover buffering, cross-chunk speech start/end, invalid PCM input, infer error propagation, graph text pass-through, graph audio chunk detector calls, and three real 16 kHz mono WAV fixtures under `internal/vad/testdata`. The real-audio Silero test writes detected speech segments to `tmp/vad-test-segments/<case-name>` for inspection; set `VAD_SEGMENT_TEST_DIR` to override the output path.
+
+The adapter uses 512-sample windows at 16 kHz and 256-sample windows at 8 kHz, matching Silero's supported sample rates while preserving streaming state between chunks.
 
 ### Voice Streaming
 
