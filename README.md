@@ -85,7 +85,7 @@ edges := workflow.NewEdgeBuilder().
 
 In that shape, `intentRouter`, `memoryWarmup`, and `profileLoad` all receive the initial workflow input and may run concurrently unless the workflow is configured with a concurrency limit. If multiple entry branches need to feed one downstream node, use a join/barrier node rather than relying on incidental completion order. Also keep terminal outputs unambiguous: the workflow errors if more than one terminal node produces final output in one completed run.
 
-`vad` is wired to `internal/vad.StreamingDetector`. Non-audio input still passes through so the text smoke-test path keeps working. Audio input should be provided as `vad.Chunk`; when a detector is configured, the node returns a streaming `vad.Decision` with speech start/end state. The Silero implementation is available through `internal/vad.NewSileroStreamingDetector(...)` and is included in the default cgo build using the repo-local ONNX Runtime.
+`vad` is wired to `internal/vad.AudioProcessor` implemented by `internal/vad.AudioGate`. Non-audio input still passes through so the text smoke-test path keeps working. Audio input should be provided as `vad.Chunk`; the graph VAD node outputs `vad.AudioOutput` containing the audio chunk to forward to ASR and a `VADEnd` flag. On speech start, after 250 ms of confirmed speech, the output includes an 800 ms pre-roll from the VAD audio gate so ASR does not lose the beginning of speech. The Silero implementation is available through `internal/vad.NewSileroStreamingDetector(...)` and is included in the default cgo build using the repo-local ONNX Runtime.
 
 `memory_context` calls ADK v2 `ctx.SearchMemory(...)`. The actual search strategy stays in the mem0-backed memory adapter: identity filters (`user_id`, `agent_id`, `run_id`), configured `topK`, and the selected mem0 mode (`self_hosted` or `cloud_v3`).
 
@@ -121,17 +121,21 @@ SILERO_VAD_MODEL_PATH=models/silero-vad/silero_vad.onnx
 VAD_SAMPLE_RATE=16000
 VAD_THRESHOLD=0.5
 VAD_MIN_SILENCE_MS=200
+VAD_MIN_SPEECH_MS=250
 VAD_SPEECH_PAD_MS=30
+VAD_PRE_ROLL_MS=800
+VAD_AUDIO_BUFFER_SECONDS=5
 ```
 
 With `VAD_PROVIDER=none`, no detector is created and the graph VAD node passes input through.
 
-Streaming behavior is implemented by the `internal/vad.Stream` window state machine. The repository carries a local copy of `github.com/streamer45/silero-vad-go` under `third_party/silero-vad-go` and uses a `go.mod` `replace` directive so the Silero detector exposes a single-frame `Infer(...)` method for true online processing:
+Streaming detection and ASR-facing audio gating are implemented by `internal/vad.AudioGate`, which maintains one 5-second circular audio buffer. The same buffer is used to accumulate Silero inference windows, snapshot the 800 ms speech-start pre-roll, and emit only `vad.AudioOutput{Chunk, VADEnd}` to the graph ASR node. The repository carries a local copy of `github.com/streamer45/silero-vad-go` under `third_party/silero-vad-go` and uses a `go.mod` `replace` directive so the Silero detector exposes a single-frame `Infer(...)` method for true online processing:
 
 - 16 kHz: 512 samples per inference window
 - 8 kHz: 256 samples per inference window
 - input formats: normalized `[]float32` or 16-bit little-endian mono PCM bytes
-- incomplete trailing samples remain buffered until the next chunk; full windows are not reprocessed
+- incomplete trailing samples remain in the same circular audio buffer until enough samples exist for the next inference window; full windows are not reprocessed
+- speech-start output requires 250 ms of continuous speech and includes the previous 800 ms of audio from a 5-second circular buffer plus the current speech-start chunk
 
 The stream keeps detector state across chunks and emits `SpeechStarted`, `SpeechEnded`, active state, segment timestamps, processed sample count, and buffered sample count. Three real speech fixtures are checked in under `internal/vad/testdata` and covered by `TestSileroDetectsSpeechFromRealWAV` in the default cgo build. That test writes detected VAD speech segments as WAV files under `tmp/vad-test-segments/<case-name>` by default; override with `VAD_SEGMENT_TEST_DIR` when you want a different inspection directory.
 

@@ -26,11 +26,6 @@ func TestSileroDetectsSpeechFromRealWAV(t *testing.T) {
 		{name: "test_wav", path: "testdata/test.wav"},
 	}
 
-	segmentRoot := vadSegmentTestDir(t)
-	if err := os.RemoveAll(segmentRoot); err != nil {
-		t.Fatalf("clean VAD segment test dir: %v", err)
-	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			pcm, sampleRate := readPCM16MonoWAV(t, tc.path)
@@ -50,20 +45,10 @@ func TestSileroDetectsSpeechFromRealWAV(t *testing.T) {
 			}
 			defer detector.Close()
 
-			segmentDir := filepath.Join(segmentRoot, tc.name)
-			writer, err := NewWAVSegmentWriter(WAVSegmentWriterConfig{
-				Dir:        segmentDir,
-				SampleRate: sampleRate,
-				Prefix:     tc.name,
-			})
-			if err != nil {
-				t.Fatalf("NewWAVSegmentWriter() error = %v", err)
-			}
-
 			const chunkBytes = 512 * 2
 			var sawSpeech bool
-			var segmentCount int
-			var fileCount int
+			var vadEndCount int
+			var outputSamples int
 			for offset := 0; offset < len(pcm); offset += chunkBytes {
 				end := offset + chunkBytes
 				if end > len(pcm) {
@@ -74,30 +59,28 @@ func TestSileroDetectsSpeechFromRealWAV(t *testing.T) {
 					SampleRate: sampleRate,
 					Final:      end == len(pcm),
 				}
-				decision, err := detector.Process(t.Context(), chunk)
+				output, err := detector.Process(t.Context(), chunk)
 				if err != nil {
 					t.Fatalf("Process(offset=%d) error = %v", offset, err)
 				}
-				if decision.SpeechStarted || decision.SpeechActive || decision.SpeechEnded {
+				if len(output.Chunk.Samples) > 0 {
 					sawSpeech = true
+					outputSamples += len(output.Chunk.Samples)
 				}
-				segmentCount += len(decision.Segments)
-				files, err := writer.Write(t.Context(), chunk, decision)
-				if err != nil {
-					t.Fatalf("Write(offset=%d) error = %v", offset, err)
+				if output.VADEnd {
+					vadEndCount++
 				}
-				fileCount += len(files)
 			}
 			if !sawSpeech {
 				t.Fatalf("Silero VAD did not detect speech in %s", tc.path)
 			}
-			if segmentCount == 0 {
-				t.Fatalf("Silero VAD produced no speech segments for %s", tc.path)
+			if outputSamples == 0 {
+				t.Fatalf("Silero VAD produced no ASR-facing audio for %s", tc.path)
 			}
-			if fileCount == 0 {
-				t.Fatal("Silero VAD produced segments, but WAV segment writer wrote no files")
+			if vadEndCount == 0 {
+				t.Fatalf("Silero VAD produced no VAD end marker for %s", tc.path)
 			}
-			t.Logf("wrote %d VAD segment WAV file(s) to %s", fileCount, segmentDir)
+			t.Logf("produced %d ASR-facing samples and %d VAD end marker(s)", outputSamples, vadEndCount)
 		})
 	}
 }

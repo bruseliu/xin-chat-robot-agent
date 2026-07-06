@@ -26,7 +26,7 @@ func TestSileroRuntimeSmoke(t *testing.T) {
 	}
 	defer detector.Close()
 
-	decision, err := detector.Process(context.Background(), Chunk{
+	output, err := detector.Process(context.Background(), Chunk{
 		Samples:    make([]float32, 1024),
 		SampleRate: 16000,
 		Final:      true,
@@ -34,8 +34,8 @@ func TestSileroRuntimeSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process() error = %v", err)
 	}
-	if decision.SampleRate != 16000 {
-		t.Fatalf("SampleRate = %d, want 16000", decision.SampleRate)
+	if output.Chunk.SampleRate != 16000 {
+		t.Fatalf("SampleRate = %d, want 16000", output.Chunk.SampleRate)
 	}
 }
 

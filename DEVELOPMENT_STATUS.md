@@ -132,7 +132,7 @@ root, err := workflowagent.New(workflowagent.Config{
 
 Workflow entry semantics are now explicitly documented in `README.md`: the first business node is whichever node is connected from `workflow.Start`. The current graph is single-entry because `workflow.Start -> vad`. If the graph later needs multiple entry nodes, represent that as `workflow.Start` fan-out. Every successor of `workflow.Start` receives the initial user input and may run concurrently. Branches that feed one downstream step should be joined deliberately, and terminal outputs must remain unambiguous because ADK errors when multiple terminal nodes produce final output in the same completed run.
 
-`vad` now calls the optional `internal/vad.StreamingDetector` configured on `GraphConfig`. Non-audio input still passes through so the text smoke-test path keeps working. Audio input uses `vad.Chunk`, and detector output is a streaming `vad.Decision`. The Silero adapter is included in the default cgo build using the repo-local ONNX Runtime; `CGO_ENABLED=0` builds cannot use `VAD_PROVIDER=silero`.
+`vad` now calls the optional `internal/vad.AudioProcessor` configured on `GraphConfig`, implemented by `internal/vad.AudioGate`. Non-audio input still passes through so the text smoke-test path keeps working. Audio input uses `vad.Chunk`; the VAD node forwards `vad.AudioOutput{Chunk, VADEnd}` to ASR. On speech start, after 250 ms of confirmed speech, `AudioGate` prepends an 800 ms pre-roll from a 5-second circular audio buffer to avoid losing the beginning of speech. The Silero adapter is included in the default cgo build using the repo-local ONNX Runtime; `CGO_ENABLED=0` builds cannot use `VAD_PROVIDER=silero`.
 
 The post-LLM graph now fans out: `llm -> memory_commit` and `llm -> tts`. `memory_commit` is intentionally side-effect-only and returns no workflow output, so it can write long-term memory without gating TTS. `tts` is the only terminal branch expected to produce user-facing output.
 
@@ -211,12 +211,12 @@ Expected responsibilities:
 
 Implemented in `internal/vad`:
 
-- `StreamingDetector` interface for graph-level injection.
-- `Stream` state machine for chunked VAD decisions.
-- Silero adapter using the repo-local `third_party/silero-vad-go` copy with an exported single-frame `Detector.Infer(...)`, wired through `internal/vad.Stream` for true window-by-window processing without replaying full audio history.
+- `AudioProcessor` interface for graph-level injection.
+- `AudioGate` single 5-second circular audio buffer that accumulates Silero inference windows, snapshots the latest 800 ms on speech start, and emits ASR-facing `AudioOutput{Chunk, VADEnd}` payloads.
+- Silero adapter using the repo-local `third_party/silero-vad-go` copy with an exported single-frame `Detector.Infer(...)`, wired through `internal/vad.AudioGate` for true window-by-window processing without replaying full audio history.
 - Default cgo builds include the real Silero adapter using the repo-local ONNX Runtime at `third_party/onnxruntime/linux-x64-1.18.1` and the repo-local Silero VAD v5 ONNX model; `CGO_ENABLED=0` builds cannot use `VAD_PROVIDER=silero`.
-- Runtime config in `.env.example`: `VAD_PROVIDER`, `SILERO_VAD_MODEL_PATH`, `VAD_SAMPLE_RATE`, `VAD_THRESHOLD`, `VAD_MIN_SILENCE_MS`, and `VAD_SPEECH_PAD_MS`.
-- Unit tests cover buffering, cross-chunk speech start/end, invalid PCM input, infer error propagation, graph text pass-through, graph audio chunk detector calls, and three real 16 kHz mono WAV fixtures under `internal/vad/testdata`. The real-audio Silero test writes detected speech segments to `tmp/vad-test-segments/<case-name>` for inspection; set `VAD_SEGMENT_TEST_DIR` to override the output path.
+- Runtime config in `.env.example`: `VAD_PROVIDER`, `SILERO_VAD_MODEL_PATH`, `VAD_SAMPLE_RATE`, `VAD_THRESHOLD`, `VAD_MIN_SILENCE_MS`, `VAD_MIN_SPEECH_MS`, `VAD_SPEECH_PAD_MS`, `VAD_PRE_ROLL_MS`, and `VAD_AUDIO_BUFFER_SECONDS`.
+- Unit tests cover single-buffer inference windowing, 800 ms pre-roll audio gating and 250 ms min-speech gating, VAD end forwarding, cross-chunk speech start/end, invalid PCM input, infer error propagation, graph text pass-through, graph audio chunk detector calls, and three real 16 kHz mono WAV fixtures under `internal/vad/testdata`. The real-audio Silero test writes detected speech segments to `tmp/vad-test-segments/<case-name>` for inspection; set `VAD_SEGMENT_TEST_DIR` to override the output path.
 
 The adapter uses 512-sample windows at 16 kHz and 256-sample windows at 8 kHz, matching Silero's supported sample rates while preserving streaming state between chunks.
 
@@ -225,7 +225,6 @@ The adapter uses 512-sample windows at 16 kHz and 256-sample windows at 8 kHz, m
 Still needed:
 
 - WebSocket or gRPC streaming endpoint
-- VAD adapter
 - Streaming ASR adapter
 - Streaming TTS adapter
 - Barge-in / interruption control

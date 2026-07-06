@@ -52,32 +52,42 @@ func TestRunVADPassesThroughText(t *testing.T) {
 	}
 }
 
+func TestRunVADRejectsAudioWithoutDetector(t *testing.T) {
+	_, err := runVAD(context.Background(), nil, vad.Chunk{Samples: make([]float32, 512), SampleRate: 16000})
+	if err == nil {
+		t.Fatal("runVAD() error = nil, want missing detector error")
+	}
+}
+
 func TestRunVADProcessesAudioChunk(t *testing.T) {
-	detector := &fakeVAD{decision: vad.Decision{SpeechActive: true, SampleRate: 16000}}
-	got, err := runVAD(context.Background(), detector, vad.Chunk{Samples: make([]float32, 512), SampleRate: 16000})
+	processor := &fakeVAD{output: vad.AudioOutput{Chunk: vad.Chunk{Samples: make([]float32, 512), SampleRate: 16000}}}
+	got, err := runVAD(context.Background(), processor, vad.Chunk{Samples: make([]float32, 512), SampleRate: 16000})
 	if err != nil {
 		t.Fatalf("runVAD() error = %v", err)
 	}
-	if detector.calls != 1 {
-		t.Fatalf("detector calls = %d, want 1", detector.calls)
+	if processor.calls != 1 {
+		t.Fatalf("processor calls = %d, want 1", processor.calls)
 	}
-	decision, ok := got.(vad.Decision)
+	output, ok := got.(vad.AudioOutput)
 	if !ok {
-		t.Fatalf("runVAD() type = %T, want vad.Decision", got)
+		t.Fatalf("runVAD() type = %T, want vad.AudioOutput", got)
 	}
-	if !decision.SpeechActive {
-		t.Fatalf("decision = %+v, want active speech", decision)
+	if len(output.Chunk.Samples) != 512 {
+		t.Fatalf("output samples = %d, want current audio chunk", len(output.Chunk.Samples))
+	}
+	if output.VADEnd {
+		t.Fatalf("VADEnd = true, want false")
 	}
 }
 
 type fakeVAD struct {
-	decision vad.Decision
-	calls    int
+	output vad.AudioOutput
+	calls  int
 }
 
-func (f *fakeVAD) Process(ctx context.Context, chunk vad.Chunk) (vad.Decision, error) {
+func (f *fakeVAD) Process(ctx context.Context, chunk vad.Chunk) (vad.AudioOutput, error) {
 	f.calls++
-	return f.decision, nil
+	return f.output, nil
 }
 
 func (f *fakeVAD) Reset() error { return nil }

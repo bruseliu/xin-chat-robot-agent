@@ -34,7 +34,10 @@ type VADConfig struct {
 	SampleRate           int
 	Threshold            float32
 	MinSilenceDurationMs int
+	MinSpeechDurationMs  int
 	SpeechPadMs          int
+	PreRollMs            int
+	AudioBufferSeconds   int
 }
 
 func Load() Config {
@@ -59,7 +62,10 @@ func Load() Config {
 			SampleRate:           envInt("VAD_SAMPLE_RATE", 16000),
 			Threshold:            envFloat32("VAD_THRESHOLD", 0.5),
 			MinSilenceDurationMs: envInt("VAD_MIN_SILENCE_MS", 200),
+			MinSpeechDurationMs:  envInt("VAD_MIN_SPEECH_MS", 250),
 			SpeechPadMs:          envInt("VAD_SPEECH_PAD_MS", 30),
+			PreRollMs:            envInt("VAD_PRE_ROLL_MS", 800),
+			AudioBufferSeconds:   envInt("VAD_AUDIO_BUFFER_SECONDS", 5),
 		},
 	}
 }

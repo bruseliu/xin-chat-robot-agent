@@ -6,7 +6,10 @@ const (
 	DefaultSampleRate           = 16000
 	DefaultThreshold            = 0.5
 	DefaultMinSilenceDurationMs = 200
+	DefaultMinSpeechDurationMs  = 250
 	DefaultSpeechPadMs          = 30
+	DefaultPreRollMs            = 800
+	DefaultAudioBufferSeconds   = 5
 )
 
 type Chunk struct {
@@ -32,8 +35,13 @@ type Decision struct {
 	Final         bool      `json:"final"`
 }
 
-type StreamingDetector interface {
-	Process(ctx context.Context, chunk Chunk) (Decision, error)
+type AudioOutput struct {
+	Chunk  Chunk `json:"chunk"`
+	VADEnd bool  `json:"vad_end"`
+}
+
+type AudioProcessor interface {
+	Process(ctx context.Context, chunk Chunk) (AudioOutput, error)
 	Reset() error
 	Close() error
 }

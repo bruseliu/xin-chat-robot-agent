@@ -15,8 +15,10 @@ import (
 )
 
 type GraphConfig struct {
-	AgentID string
-	VAD     vad.StreamingDetector
+	AgentID               string
+	VAD                   vad.AudioProcessor
+	VADPreRollMs          int
+	VADAudioBufferSeconds int
 }
 
 type Graph struct {
@@ -140,18 +142,21 @@ func NewGraph(cfg GraphConfig) (*Graph, error) {
 	return &Graph{Root: root, Edges: edges}, nil
 }
 
-func runVAD(ctx context.Context, detector vad.StreamingDetector, input any) (any, error) {
-	if detector == nil {
-		return input, nil
-	}
+func runVAD(ctx context.Context, processor vad.AudioProcessor, input any) (any, error) {
 	switch value := input.(type) {
 	case vad.Chunk:
-		return detector.Process(ctx, value)
+		if processor == nil {
+			return nil, fmt.Errorf("vad audio input requires a configured detector")
+		}
+		return processor.Process(ctx, value)
 	case *vad.Chunk:
 		if value == nil {
 			return nil, fmt.Errorf("vad input chunk is nil")
 		}
-		return detector.Process(ctx, *value)
+		if processor == nil {
+			return nil, fmt.Errorf("vad audio input requires a configured detector")
+		}
+		return processor.Process(ctx, *value)
 	default:
 		return input, nil
 	}
@@ -166,6 +171,10 @@ func normalizeTextInput(input any) string {
 	case TurnContext:
 		if value.Text != "" {
 			return value.Text
+		}
+	case vad.AudioOutput:
+		if len(value.Chunk.Samples) > 0 || len(value.Chunk.PCM16LE) > 0 || value.VADEnd {
+			return "asr node: placeholder transcript from VAD-gated audio input."
 		}
 	case map[string]any:
 		if text, ok := value["text"].(string); ok && text != "" {

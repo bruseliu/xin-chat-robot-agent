@@ -14,13 +14,16 @@ type SileroConfig struct {
 	SampleRate           int
 	Threshold            float32
 	MinSilenceDurationMs int
+	MinSpeechDurationMs  int
 	SpeechPadMs          int
 	LogLevel             int
+	PreRollMs            int
+	AudioBufferSeconds   int
 }
 
 type SileroStreamingDetector struct {
 	detector *speech.Detector
-	stream   *Stream
+	gate     *AudioGate
 }
 
 func NewSileroStreamingDetector(cfg SileroConfig) (*SileroStreamingDetector, error) {
@@ -28,6 +31,7 @@ func NewSileroStreamingDetector(cfg SileroConfig) (*SileroStreamingDetector, err
 		SampleRate:           cfg.SampleRate,
 		Threshold:            cfg.Threshold,
 		MinSilenceDurationMs: cfg.MinSilenceDurationMs,
+		MinSpeechDurationMs:  cfg.MinSpeechDurationMs,
 		SpeechPadMs:          cfg.SpeechPadMs,
 	})
 	if err := validateStreamConfig(streamCfg); err != nil {
@@ -44,29 +48,32 @@ func NewSileroStreamingDetector(cfg SileroConfig) (*SileroStreamingDetector, err
 	if err != nil {
 		return nil, fmt.Errorf("create silero vad detector: %w", err)
 	}
-	stream, err := NewStream(streamCfg, sileroInferer{detector: detector})
+	gate, err := NewAudioGate(sileroInferer{detector: detector}, streamCfg, AudioGateConfig{
+		PreRollMs:          cfg.PreRollMs,
+		AudioBufferSeconds: cfg.AudioBufferSeconds,
+	})
 	if err != nil {
 		_ = detector.Destroy()
 		return nil, err
 	}
 	return &SileroStreamingDetector{
 		detector: detector,
-		stream:   stream,
+		gate:     gate,
 	}, nil
 }
 
-func (d *SileroStreamingDetector) Process(ctx context.Context, chunk Chunk) (Decision, error) {
-	if d == nil || d.stream == nil {
-		return Decision{}, fmt.Errorf("vad: nil silero detector")
+func (d *SileroStreamingDetector) Process(ctx context.Context, chunk Chunk) (AudioOutput, error) {
+	if d == nil || d.gate == nil {
+		return AudioOutput{}, fmt.Errorf("vad: nil silero detector")
 	}
-	return d.stream.Process(ctx, chunk)
+	return d.gate.Process(ctx, chunk)
 }
 
 func (d *SileroStreamingDetector) Reset() error {
-	if d == nil || d.stream == nil {
+	if d == nil || d.gate == nil {
 		return fmt.Errorf("vad: nil silero detector")
 	}
-	return d.stream.Reset()
+	return d.gate.Reset()
 }
 
 func (d *SileroStreamingDetector) Close() error {

@@ -9,7 +9,7 @@ import (
 	"xin-chat-robot-agent/internal/vad"
 )
 
-func newVADDetector(cfg config.VADConfig) (vad.StreamingDetector, error) {
+func newVADDetector(cfg config.VADConfig) (vad.AudioProcessor, error) {
 	switch cfg.Provider {
 	case "", "none":
 		return nil, nil

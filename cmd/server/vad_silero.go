@@ -9,7 +9,7 @@ import (
 	"xin-chat-robot-agent/internal/vad"
 )
 
-func newVADDetector(cfg config.VADConfig) (vad.StreamingDetector, error) {
+func newVADDetector(cfg config.VADConfig) (vad.AudioProcessor, error) {
 	switch cfg.Provider {
 	case "", "none":
 		return nil, nil
@@ -19,7 +19,10 @@ func newVADDetector(cfg config.VADConfig) (vad.StreamingDetector, error) {
 			SampleRate:           cfg.SampleRate,
 			Threshold:            cfg.Threshold,
 			MinSilenceDurationMs: cfg.MinSilenceDurationMs,
+			MinSpeechDurationMs:  cfg.MinSpeechDurationMs,
 			SpeechPadMs:          cfg.SpeechPadMs,
+			PreRollMs:            cfg.PreRollMs,
+			AudioBufferSeconds:   cfg.AudioBufferSeconds,
 		})
 	default:
 		return nil, fmt.Errorf("unsupported VAD_PROVIDER %q", cfg.Provider)
