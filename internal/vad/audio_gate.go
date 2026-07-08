@@ -8,6 +8,7 @@ import (
 type AudioGateConfig struct {
 	PreRollMs          int
 	AudioBufferSeconds int
+	MaxSpeechMs        int
 }
 
 type AudioGate struct {
@@ -18,14 +19,17 @@ type AudioGate struct {
 	minSpeechSamples   int
 	preRollMs          int
 	audioBufferSeconds int
+	maxSpeechSamples   int
 
-	sampleRate int
-	audio      sampleRing
-	vadRead    int64
-	sendCursor int64
-	active     bool
-	tempStart  int64
-	tempEnd    int64
+	sampleRate   int
+	audio        sampleRing
+	vadRead      int64
+	sendCursor   int64
+	active       bool
+	tempStart    int64
+	tempEnd      int64
+	speechStart  int64
+	preRollFloor int64
 }
 
 func NewAudioGate(inferer Inferer, streamCfg StreamConfig, cfg AudioGateConfig) (*AudioGate, error) {
@@ -51,10 +55,17 @@ func NewAudioGate(inferer Inferer, streamCfg StreamConfig, cfg AudioGateConfig) 
 	if cfg.AudioBufferSeconds*1000 < cfg.PreRollMs {
 		return nil, fmt.Errorf("vad: audio buffer must be at least as large as pre-roll")
 	}
+	if cfg.MaxSpeechMs == 0 {
+		cfg.MaxSpeechMs = DefaultMaxSpeechMs
+	}
+	if cfg.MaxSpeechMs < 0 {
+		return nil, fmt.Errorf("vad: max speech duration must be non-negative")
+	}
 	windowSize := 512
 	if streamCfg.SampleRate == 8000 {
 		windowSize = 256
 	}
+	maxSpeechSamples := cfg.MaxSpeechMs * streamCfg.SampleRate / 1000
 	return &AudioGate{
 		inferer:            inferer,
 		cfg:                streamCfg,
@@ -63,6 +74,7 @@ func NewAudioGate(inferer Inferer, streamCfg StreamConfig, cfg AudioGateConfig) 
 		minSpeechSamples:   streamCfg.MinSpeechDurationMs * streamCfg.SampleRate / 1000,
 		preRollMs:          cfg.PreRollMs,
 		audioBufferSeconds: cfg.AudioBufferSeconds,
+		maxSpeechSamples:   maxSpeechSamples,
 	}, nil
 }
 
@@ -102,10 +114,7 @@ func (g *AudioGate) Process(ctx context.Context, chunk Chunk) (AudioOutput, erro
 		g.vadRead += int64(g.windowSize)
 		started, ended := g.applyProbability(probability)
 		if started {
-			start := g.vadRead - int64(g.preRollSamples())
-			if start < g.audio.Start() {
-				start = g.audio.Start()
-			}
+			start := g.preRollStart()
 			out = append(out, g.audio.CopyRange(start, g.vadRead)...)
 			g.sendCursor = g.vadRead
 		}
@@ -113,10 +122,19 @@ func (g *AudioGate) Process(ctx context.Context, chunk Chunk) (AudioOutput, erro
 			out = append(out, g.audio.CopyRange(g.sendCursor, g.vadRead)...)
 			g.sendCursor = g.vadRead
 		}
+		forcedEnd := g.forceEndDueToMaxSpeech()
+		if forcedEnd {
+			if g.sendCursor < g.vadRead {
+				out = append(out, g.audio.CopyRange(g.sendCursor, g.vadRead)...)
+			}
+			g.endActiveSpeech()
+		}
 		if ended {
 			vadEnd = true
-			g.active = false
-			g.sendCursor = g.vadRead
+			g.endActiveSpeech()
+		}
+		if forcedEnd {
+			vadEnd = true
 		}
 	}
 
@@ -126,7 +144,7 @@ func (g *AudioGate) Process(ctx context.Context, chunk Chunk) (AudioOutput, erro
 			g.sendCursor = g.audio.End()
 		}
 		vadEnd = true
-		g.active = false
+		g.endActiveSpeech()
 	}
 
 	return AudioOutput{
@@ -149,6 +167,8 @@ func (g *AudioGate) Reset() error {
 	g.active = false
 	g.tempStart = 0
 	g.tempEnd = 0
+	g.speechStart = 0
+	g.preRollFloor = 0
 	return g.inferer.Reset()
 }
 
@@ -175,6 +195,30 @@ func (g *AudioGate) preRollSamples() int {
 	return g.preRollMs * g.cfg.SampleRate / 1000
 }
 
+func (g *AudioGate) preRollStart() int64 {
+	start := g.vadRead - int64(g.preRollSamples())
+	if start < g.audio.Start() {
+		start = g.audio.Start()
+	}
+	if start < g.preRollFloor {
+		start = g.preRollFloor
+	}
+	return start
+}
+
+func (g *AudioGate) forceEndDueToMaxSpeech() bool {
+	return g.maxSpeechSamples > 0 && g.active && g.speechStart != 0 && g.vadRead-g.speechStart >= int64(g.maxSpeechSamples)
+}
+
+func (g *AudioGate) endActiveSpeech() {
+	g.active = false
+	g.tempStart = 0
+	g.tempEnd = 0
+	g.speechStart = 0
+	g.sendCursor = g.vadRead
+	g.preRollFloor = g.vadRead
+}
+
 func (g *AudioGate) applyProbability(probability float32) (started bool, ended bool) {
 	if probability >= g.cfg.Threshold && g.tempEnd != 0 {
 		g.tempEnd = 0
@@ -188,6 +232,7 @@ func (g *AudioGate) applyProbability(probability float32) (started bool, ended b
 			return false, false
 		}
 		g.active = true
+		g.speechStart = g.tempStart
 		return true, false
 	}
 	if probability < g.cfg.Threshold && !g.active {

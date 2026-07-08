@@ -1,11 +1,8 @@
 package agent
 
 import (
-	"context"
 	"fmt"
 	"strings"
-
-	"xin-chat-robot-agent/internal/vad"
 
 	adkagent "google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/workflowagent"
@@ -15,10 +12,7 @@ import (
 )
 
 type GraphConfig struct {
-	AgentID               string
-	VAD                   vad.AudioProcessor
-	VADPreRollMs          int
-	VADAudioBufferSeconds int
+	AgentID string
 }
 
 type Graph struct {
@@ -56,27 +50,15 @@ type LLMOutput struct {
 	Attachments []AttachmentRef `json:"attachments,omitempty"`
 }
 
-type TTSOutput struct {
-	Text  string         `json:"text"`
-	Audio *AttachmentRef `json:"audio,omitempty"`
-}
-
 func NewGraph(cfg GraphConfig) (*Graph, error) {
 	nodeConfig := workflow.NodeConfig{
 		RetryConfig: workflow.DefaultRetryConfig(),
 	}
 
-	vadNode := workflow.NewFunctionNode(
-		"vad",
-		func(ctx adkagent.Context, input any) (any, error) {
-			return runVAD(ctx, cfg.VAD, input)
-		},
-		nodeConfig,
-	)
-	asr := workflow.NewFunctionNode(
-		"asr",
+	turnContext := workflow.NewFunctionNode(
+		"turn_context",
 		func(ctx adkagent.Context, input any) (TurnContext, error) {
-			return TurnContext{Text: normalizeTextInput(input)}, nil
+			return normalizeTurnContext(input)
 		},
 		nodeConfig,
 	)
@@ -105,34 +87,21 @@ func NewGraph(cfg GraphConfig) (*Graph, error) {
 	memoryCommit := workflow.NewFunctionNode(
 		"memory_commit",
 		func(ctx adkagent.Context, output LLMOutput) (any, error) {
-			// Side-effect node: future memory writes should not gate or compete with TTS output.
+			// Side-effect node: future memory writes should not gate response streaming.
 			return nil, nil
-		},
-		nodeConfig,
-	)
-	tts := workflow.NewFunctionNode(
-		"tts",
-		func(ctx adkagent.Context, output LLMOutput) (TTSOutput, error) {
-			return TTSOutput{Text: output.Text}, nil
 		},
 		nodeConfig,
 	)
 
 	rootName := cfg.AgentID
 	if rootName == "" {
-		rootName = "voice_agent_graph"
+		rootName = "text_agent_graph"
 	}
 
-	edges := workflow.Concat(
-		workflow.Chain(workflow.Start, vadNode, asr, memoryContext, llm),
-		[]workflow.Edge{
-			{From: llm, To: memoryCommit},
-			{From: llm, To: tts},
-		},
-	)
+	edges := workflow.Chain(workflow.Start, turnContext, memoryContext, llm, memoryCommit)
 	root, err := workflowagent.New(workflowagent.Config{
 		Name:        rootName,
-		Description: "Voice chatbot ADK workflow graph: VAD -> ASR -> memory_context -> LLM fan-out to memory_commit and TTS.",
+		Description: "Text chatbot ADK workflow graph: turn_context -> memory_context -> LLM -> memory_commit.",
 		Edges:       edges,
 	})
 	if err != nil {
@@ -142,46 +111,26 @@ func NewGraph(cfg GraphConfig) (*Graph, error) {
 	return &Graph{Root: root, Edges: edges}, nil
 }
 
-func runVAD(ctx context.Context, processor vad.AudioProcessor, input any) (any, error) {
-	switch value := input.(type) {
-	case vad.Chunk:
-		if processor == nil {
-			return nil, fmt.Errorf("vad audio input requires a configured detector")
-		}
-		return processor.Process(ctx, value)
-	case *vad.Chunk:
-		if value == nil {
-			return nil, fmt.Errorf("vad input chunk is nil")
-		}
-		if processor == nil {
-			return nil, fmt.Errorf("vad audio input requires a configured detector")
-		}
-		return processor.Process(ctx, *value)
-	default:
-		return input, nil
-	}
-}
-
-func normalizeTextInput(input any) string {
+func normalizeTurnContext(input any) (TurnContext, error) {
 	switch value := input.(type) {
 	case string:
-		if value != "" {
-			return value
-		}
+		return TurnContext{Text: value}, nil
 	case TurnContext:
-		if value.Text != "" {
-			return value.Text
+		return value, nil
+	case *TurnContext:
+		if value == nil {
+			return TurnContext{}, fmt.Errorf("turn context is nil")
 		}
-	case vad.AudioOutput:
-		if len(value.Chunk.Samples) > 0 || len(value.Chunk.PCM16LE) > 0 || value.VADEnd {
-			return "asr node: placeholder transcript from VAD-gated audio input."
-		}
+		return *value, nil
 	case map[string]any:
-		if text, ok := value["text"].(string); ok && text != "" {
-			return text
+		turn := TurnContext{}
+		if text, ok := value["text"].(string); ok {
+			turn.Text = text
 		}
+		return turn, nil
+	default:
+		return TurnContext{}, fmt.Errorf("unsupported turn input type %T", input)
 	}
-	return "asr node: placeholder transcript from streaming audio input."
 }
 
 func memoryInputs(resp *adkmemory.SearchResponse) []MemoryInput {

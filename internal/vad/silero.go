@@ -19,6 +19,7 @@ type SileroConfig struct {
 	LogLevel             int
 	PreRollMs            int
 	AudioBufferSeconds   int
+	MaxSpeechMs          int
 }
 
 type SileroStreamingDetector struct {
@@ -51,6 +52,7 @@ func NewSileroStreamingDetector(cfg SileroConfig) (*SileroStreamingDetector, err
 	gate, err := NewAudioGate(sileroInferer{detector: detector}, streamCfg, AudioGateConfig{
 		PreRollMs:          cfg.PreRollMs,
 		AudioBufferSeconds: cfg.AudioBufferSeconds,
+		MaxSpeechMs:        cfg.MaxSpeechMs,
 	})
 	if err != nil {
 		_ = detector.Destroy()

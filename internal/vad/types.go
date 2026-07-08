@@ -10,6 +10,7 @@ const (
 	DefaultSpeechPadMs          = 30
 	DefaultPreRollMs            = 800
 	DefaultAudioBufferSeconds   = 5
+	DefaultMaxSpeechMs          = 15000
 )
 
 type Chunk struct {

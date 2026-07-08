@@ -14,6 +14,7 @@ import (
 	"xin-chat-robot-agent/internal/config"
 	"xin-chat-robot-agent/internal/memory"
 	"xin-chat-robot-agent/internal/sessionstore"
+	"xin-chat-robot-agent/internal/vad"
 	"xin-chat-robot-agent/internal/voice"
 )
 
@@ -41,20 +42,7 @@ func main() {
 	}
 	adkMemoryService := memory.NewADKService(memClient, cfg.AgentID, cfg.Mem0.TopK)
 
-	vadDetector, err := newVADDetector(cfg.VAD)
-	if err != nil {
-		logger.Error("create VAD detector failed", "error", err)
-		os.Exit(1)
-	}
-	if vadDetector != nil {
-		defer func() {
-			if err := vadDetector.Close(); err != nil {
-				logger.Warn("close VAD detector failed", "error", err)
-			}
-		}()
-	}
-
-	graph, err := agent.NewGraph(agent.GraphConfig{AgentID: cfg.AgentID, VAD: vadDetector})
+	graph, err := agent.NewGraph(agent.GraphConfig{AgentID: cfg.AgentID})
 	if err != nil {
 		logger.Error("create ADK graph failed", "error", err)
 		os.Exit(1)
@@ -74,8 +62,16 @@ func main() {
 
 	pipeline := voice.NewPipeline(agentRunner, memClient, logger)
 	server := api.NewServer(api.Config{
-		Addr: cfg.Addr,
-	}, pipeline, logger)
+		Addr:       cfg.Addr,
+		SampleRate: cfg.VAD.SampleRate,
+	}, pipeline, logger,
+		func() (vad.AudioProcessor, error) {
+			return newVADDetector(cfg.VAD)
+		},
+		func(ctx context.Context) (voice.StreamingASR, error) {
+			return newASRStream(ctx, cfg.ASR)
+		},
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

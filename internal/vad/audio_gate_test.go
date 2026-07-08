@@ -92,6 +92,71 @@ func TestAudioGateMarksEndAndForwardsCurrentWindow(t *testing.T) {
 	}
 }
 
+func TestAudioGateForceCutsContinuousSpeech(t *testing.T) {
+	inferer := &scriptedInferer{probs: scriptedProbs(20, 0.8)}
+	gate, err := NewAudioGate(inferer, StreamConfig{
+		SampleRate:          16000,
+		Threshold:           0.5,
+		MinSpeechDurationMs: 32,
+	}, AudioGateConfig{
+		PreRollMs:          0,
+		AudioBufferSeconds: 1,
+		MaxSpeechMs:        96,
+	})
+	if err != nil {
+		t.Fatalf("NewAudioGate() error = %v", err)
+	}
+
+	out, err := gate.Process(context.Background(), Chunk{Samples: makeSequence(4*512, 1000), SampleRate: 16000})
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if !out.VADEnd {
+		t.Fatal("VADEnd = false, want true after max speech duration")
+	}
+	if len(out.Chunk.Samples) == 0 {
+		t.Fatal("output samples = 0, want forced-cut speech audio")
+	}
+}
+
+func TestAudioGateForceCutBoundsNextPreRoll(t *testing.T) {
+	inferer := &scriptedInferer{probs: scriptedProbs(20, 0.8)}
+	gate, err := NewAudioGate(inferer, StreamConfig{
+		SampleRate:          16000,
+		Threshold:           0.5,
+		MinSpeechDurationMs: 32,
+	}, AudioGateConfig{
+		PreRollMs:          64,
+		AudioBufferSeconds: 1,
+		MaxSpeechMs:        96,
+	})
+	if err != nil {
+		t.Fatalf("NewAudioGate() error = %v", err)
+	}
+
+	out, err := gate.Process(context.Background(), Chunk{Samples: makeSequence(4*512, 1000), SampleRate: 16000})
+	if err != nil {
+		t.Fatalf("Process(first segment) error = %v", err)
+	}
+	if !out.VADEnd {
+		t.Fatal("first segment VADEnd = false, want forced cut")
+	}
+
+	out, err = gate.Process(context.Background(), Chunk{Samples: makeSequence(2*512, 4000), SampleRate: 16000})
+	if err != nil {
+		t.Fatalf("Process(second segment) error = %v", err)
+	}
+	if out.VADEnd {
+		t.Fatal("second segment VADEnd = true, want active segment without forced cut yet")
+	}
+	if got, want := len(out.Chunk.Samples), 1024; got != want {
+		t.Fatalf("second segment samples = %d, want %d", got, want)
+	}
+	if out.Chunk.Samples[0] != 4000 {
+		t.Fatalf("second segment first sample = %v, want 4000 (no pre-cut pre-roll duplicate)", out.Chunk.Samples[0])
+	}
+}
+
 func TestAudioGatePropagatesInferError(t *testing.T) {
 	wantErr := errors.New("infer failed")
 	gate, err := NewAudioGate(&scriptedInferer{err: wantErr}, StreamConfig{}, AudioGateConfig{})

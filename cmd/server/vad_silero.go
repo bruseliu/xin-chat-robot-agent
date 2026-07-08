@@ -23,6 +23,7 @@ func newVADDetector(cfg config.VADConfig) (vad.AudioProcessor, error) {
 			SpeechPadMs:          cfg.SpeechPadMs,
 			PreRollMs:            cfg.PreRollMs,
 			AudioBufferSeconds:   cfg.AudioBufferSeconds,
+			MaxSpeechMs:          cfg.MaxSpeechMs,
 		})
 	default:
 		return nil, fmt.Errorf("unsupported VAD_PROVIDER %q", cfg.Provider)

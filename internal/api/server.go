@@ -3,31 +3,53 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 
+	"github.com/gorilla/websocket"
+
+	"xin-chat-robot-agent/internal/vad"
 	"xin-chat-robot-agent/internal/voice"
 )
 
 type Config struct {
-	Addr string
+	Addr       string
+	SampleRate int
 }
+
+type VADFactory func() (vad.AudioProcessor, error)
+
+type ASRFactory func(ctx context.Context) (voice.StreamingASR, error)
 
 type Server struct {
 	httpServer *http.Server
 	pipeline   *voice.Pipeline
 	logger     *slog.Logger
+	upgrader   websocket.Upgrader
+	vadFactory VADFactory
+	asrFactory ASRFactory
+	sampleRate int
 }
 
-func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger) *Server {
+func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger, vadFactory VADFactory, asrFactory ASRFactory) *Server {
+	if cfg.SampleRate == 0 {
+		cfg.SampleRate = vad.DefaultSampleRate
+	}
 	server := &Server{
-		pipeline: pipeline,
-		logger:   logger,
+		pipeline:   pipeline,
+		logger:     logger,
+		upgrader:   websocket.Upgrader{},
+		vadFactory: vadFactory,
+		asrFactory: asrFactory,
+		sampleRate: cfg.SampleRate,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.handleHealth)
 	mux.HandleFunc("POST /v1/chat/text", server.handleTextTurn)
+	mux.HandleFunc("GET /v1/chat/voice", server.handleVoiceStream)
 
 	server.httpServer = &http.Server{
 		Addr:    cfg.Addr,
@@ -78,6 +100,118 @@ func (s *Server) handleTextTurn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
+	if s.vadFactory == nil || s.asrFactory == nil {
+		writeError(w, http.StatusServiceUnavailable, "voice streaming is not configured")
+		return
+	}
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		writeError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+	sessionID := r.URL.Query().Get("session_id")
+	sampleRate := s.sampleRate
+	if raw := r.URL.Query().Get("sample_rate"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			writeError(w, http.StatusBadRequest, "sample_rate must be a positive integer")
+			return
+		}
+		sampleRate = parsed
+	}
+
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		s.logger.Warn("voice websocket upgrade failed", "error", err)
+		return
+	}
+	defer conn.Close()
+
+	processor, err := s.vadFactory()
+	if err != nil {
+		writeWSError(conn, "vad_create_failed", err)
+		return
+	}
+	asr, err := s.asrFactory(r.Context())
+	if err != nil {
+		if processor != nil {
+			_ = processor.Close()
+		}
+		writeWSError(conn, "asr_create_failed", err)
+		return
+	}
+	session, err := voice.NewVoiceSession(s.pipeline, processor, asr, voice.VoiceSessionConfig{
+		UserID:    userID,
+		SessionID: sessionID,
+		Metadata: map[string]string{
+			"transport": "websocket",
+		},
+	})
+	if err != nil {
+		if processor != nil {
+			_ = processor.Close()
+		}
+		if asr != nil {
+			_ = asr.Close()
+		}
+		writeWSError(conn, "voice_session_create_failed", err)
+		return
+	}
+	defer session.Close()
+
+	for {
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		switch messageType {
+		case websocket.BinaryMessage:
+			out, err := session.ProcessAudio(r.Context(), voice.AudioChunk{PCM16LE: payload, SampleRate: sampleRate})
+			if err != nil {
+				writeWSError(conn, "voice_process_failed", err)
+				return
+			}
+			if out.Final {
+				if err := conn.WriteJSON(out); err != nil {
+					return
+				}
+			}
+		case websocket.TextMessage:
+			var msg voiceControlMessage
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				writeWSError(conn, "invalid_control_message", err)
+				return
+			}
+			if msg.Type != "final" {
+				writeWSError(conn, "unsupported_control_message", fmt.Errorf("unsupported control type %q", msg.Type))
+				return
+			}
+			out, err := session.ProcessAudio(r.Context(), voice.AudioChunk{SampleRate: sampleRate, Final: true})
+			if err != nil {
+				writeWSError(conn, "voice_finalize_failed", err)
+				return
+			}
+			if out.Final {
+				if err := conn.WriteJSON(out); err != nil {
+					return
+				}
+			}
+		}
+	}
+}
+
+type voiceControlMessage struct {
+	Type string `json:"type"`
+}
+
+func writeWSError(conn *websocket.Conn, code string, err error) {
+	_ = conn.WriteJSON(map[string]string{
+		"error":  code,
+		"detail": err.Error(),
+	})
 }
 
 func requestLogger(next http.Handler, logger *slog.Logger) http.Handler {

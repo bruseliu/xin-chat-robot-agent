@@ -20,27 +20,6 @@ type TextTurnOutput struct {
 	Memories []memory.Memory `json:"memories,omitempty"`
 }
 
-type AudioChunk struct {
-	SessionID string
-	UserID    string
-	PCM       []byte
-	Final     bool
-}
-
-type ASR interface {
-	Accept(ctx context.Context, chunk AudioChunk) (Transcript, error)
-}
-
-type TTS interface {
-	Synthesize(ctx context.Context, text string) (<-chan []byte, error)
-}
-
-type Transcript struct {
-	Text       string
-	IsFinal    bool
-	Confidence float64
-}
-
 type Pipeline struct {
 	agent  agent.Runner
 	memory memory.Store

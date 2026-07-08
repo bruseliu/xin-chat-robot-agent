@@ -13,6 +13,7 @@ type Config struct {
 	Mem0    Mem0Config
 	Session SessionConfig
 	VAD     VADConfig
+	ASR     ASRConfig
 }
 
 type SessionConfig struct {
@@ -28,6 +29,20 @@ type Mem0Config struct {
 	Timeout time.Duration
 }
 
+type ASRConfig struct {
+	Provider            string
+	DoubaoURL           string
+	DoubaoAppKey        string
+	DoubaoAccessKey     string
+	DoubaoResourceID    string
+	DoubaoModelName     string
+	DoubaoLanguage      string
+	DoubaoSampleRate    int
+	DoubaoEnablePunc    bool
+	DoubaoCompressAudio bool
+	DoubaoTimeout       time.Duration
+}
+
 type VADConfig struct {
 	Provider             string
 	SileroModelPath      string
@@ -38,6 +53,7 @@ type VADConfig struct {
 	SpeechPadMs          int
 	PreRollMs            int
 	AudioBufferSeconds   int
+	MaxSpeechMs          int
 }
 
 func Load() Config {
@@ -66,6 +82,20 @@ func Load() Config {
 			SpeechPadMs:          envInt("VAD_SPEECH_PAD_MS", 30),
 			PreRollMs:            envInt("VAD_PRE_ROLL_MS", 800),
 			AudioBufferSeconds:   envInt("VAD_AUDIO_BUFFER_SECONDS", 5),
+			MaxSpeechMs:          envInt("VAD_MAX_SPEECH_MS", 15000),
+		},
+		ASR: ASRConfig{
+			Provider:            envString("ASR_PROVIDER", "none"),
+			DoubaoURL:           envString("DOUBAO_ASR_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"),
+			DoubaoAppKey:        envString("DOUBAO_ASR_APP_KEY", ""),
+			DoubaoAccessKey:     envString("DOUBAO_ASR_ACCESS_KEY", ""),
+			DoubaoResourceID:    envString("DOUBAO_ASR_RESOURCE_ID", "volc.bigasr.sauc.duration"),
+			DoubaoModelName:     envString("DOUBAO_ASR_MODEL_NAME", "bigmodel"),
+			DoubaoLanguage:      envString("DOUBAO_ASR_LANGUAGE", "zh-CN"),
+			DoubaoSampleRate:    envInt("DOUBAO_ASR_SAMPLE_RATE", 16000),
+			DoubaoEnablePunc:    envBool("DOUBAO_ASR_ENABLE_PUNC", true),
+			DoubaoCompressAudio: envBool("DOUBAO_ASR_COMPRESS_AUDIO", true),
+			DoubaoTimeout:       time.Duration(envInt("DOUBAO_ASR_TIMEOUT_SECONDS", 30)) * time.Second,
 		},
 	}
 }
