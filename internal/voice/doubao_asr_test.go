@@ -108,6 +108,14 @@ func TestDoubaoASRStreamingLifecycle(t *testing.T) {
 	if transcript.Confidence != 0.98 {
 		t.Fatalf("confidence = %v, want 0.98", transcript.Confidence)
 	}
+	partial := <-stream.Transcripts()
+	if partial.Text != "你好" || partial.IsFinal {
+		t.Fatalf("partial transcript = %+v, want non-final 你好", partial)
+	}
+	finalEvent := <-stream.Transcripts()
+	if finalEvent.Text != "你好世界" || !finalEvent.IsFinal {
+		t.Fatalf("final transcript event = %+v, want final 你好世界", finalEvent)
+	}
 
 	packets := <-seen
 	if got := packets[0].MessageType; got != doubaoMsgFullClientRequest {
@@ -121,6 +129,9 @@ func TestDoubaoASRStreamingLifecycle(t *testing.T) {
 	}
 	if got := packets[2].Sequence; got != -3 {
 		t.Fatalf("final sequence = %d, want -3", got)
+	}
+	if packets[1].IsFinal {
+		t.Fatal("audio packet IsFinal = true, want false")
 	}
 	if !packets[2].IsFinal {
 		t.Fatal("final packet IsFinal = false, want true")

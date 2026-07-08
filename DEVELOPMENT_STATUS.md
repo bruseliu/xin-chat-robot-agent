@@ -114,11 +114,11 @@ client audio stream
       -> client audio
 ```
 
-`VoiceSession` owns the per-connection VAD processor and `StreamingASR` stream. It writes VAD-gated speech audio to ASR and calls `Finalize(...)` only when VAD emits `VADEnd`. The final transcript is then passed to the existing text turn path, which is the boundary where ADK starts.
+`VoiceSession` owns the per-connection VAD processor and `StreamingASR` stream. It writes VAD-gated speech audio to ASR, treats `VADEnd` as a VAD segment boundary, and calls `Finalize(...)` only when the whole client audio stream ends. This lets several VAD speech segments share one ASR connection before the final transcript is passed to the existing text turn path, which is the boundary where ADK starts.
 
-`internal/voice.DoubaoASR` implements `StreamingASR` for Doubao/Volcengine WebSocket ASR. Runtime configuration is loaded from `ASR_PROVIDER=doubao` plus the `DOUBAO_ASR_*` environment variables in `.env.example`.
+`internal/voice.DoubaoASR` implements `StreamingASR` for Doubao/Volcengine WebSocket ASR. Runtime configuration is loaded from `ASR_PROVIDER=doubao` plus the `DOUBAO_ASR_*` environment variables in `.env.example`. It exposes streaming recognition updates through `Transcripts() <-chan Transcript` while `Finalize(...)` still waits for the service-side final response.
 
-`GET /v1/chat/voice` now creates a per-connection VAD detector and ASR stream, constructs `VoiceSession`, accepts PCM16LE binary WebSocket messages, and emits JSON `VoiceTurnOutput` only after ASR finalization.
+`GET /v1/chat/voice` now creates a per-connection VAD detector and ASR stream, constructs `VoiceSession`, accepts PCM16LE binary WebSocket messages, forwards only VAD-gated chunks to ASR, and emits JSON `VoiceTurnOutput` only after whole-stream ASR finalization.
 
 This avoids relying on ADK workflow edges as realtime pipes. ADK workflow successors are scheduled after upstream node completion, so continuous VAD->ASR and LLM->TTS streams are handled by the voice runtime/transport layer instead.
 
@@ -212,19 +212,24 @@ Implemented in `internal/vad`:
 - Silero adapter using the repo-local `third_party/silero-vad-go` copy with an exported single-frame `Detector.Infer(...)`, wired through `internal/vad.AudioGate` for true window-by-window processing without replaying full audio history.
 - Default cgo builds include the real Silero adapter using the repo-local ONNX Runtime at `third_party/onnxruntime/linux-x64-1.18.1` and the repo-local Silero VAD v5 ONNX model; `CGO_ENABLED=0` builds cannot use `VAD_PROVIDER=silero`.
 - Runtime config in `.env.example`: `VAD_PROVIDER`, `SILERO_VAD_MODEL_PATH`, `VAD_SAMPLE_RATE`, `VAD_THRESHOLD`, `VAD_MIN_SILENCE_MS`, `VAD_MIN_SPEECH_MS`, `VAD_SPEECH_PAD_MS`, `VAD_PRE_ROLL_MS`, `VAD_AUDIO_BUFFER_SECONDS`, and `VAD_MAX_SPEECH_MS`.
-- Unit tests cover single-buffer inference windowing, 800 ms pre-roll audio gating and 250 ms min-speech gating, VAD end forwarding, continuous-speech force cuts, cross-chunk speech start/end, invalid PCM input, infer error propagation, VoiceSession VAD-to-ASR final transcript handoff, `/v1/chat/voice` WebSocket session wiring, Doubao ASR WebSocket packet lifecycle/parsing, and three real 16 kHz mono WAV fixtures under `internal/vad/testdata`. The real-audio Silero test writes detected speech segments to `tmp/vad-test-segments/<case-name>` for inspection; set `VAD_SEGMENT_TEST_DIR` to override the output path.
+- Unit tests cover single-buffer inference windowing, 800 ms pre-roll audio gating and 250 ms min-speech gating, VAD end forwarding, continuous-speech force cuts, cross-chunk speech start/end, invalid PCM input, infer error propagation, VoiceSession forwarding multiple VAD segments into one ASR stream, `/v1/chat/voice` WebSocket session wiring, Doubao ASR WebSocket packet lifecycle/parsing, streaming transcript events, and real 16 kHz mono WAV fixtures under `internal/vad/testdata`. The real-audio Silero test writes detected VAD speech segments to `tmp/vad-test-segments/<case-name>` for inspection; set `VAD_SEGMENT_TEST_DIR` to override the output path.
 
-The adapter uses 512-sample windows at 16 kHz and 256-sample windows at 8 kHz, matching Silero's supported sample rates while preserving streaming state between chunks. Continuous active speech is force-cut at `VAD_MAX_SPEECH_MS` by emitting `VADEnd`, giving ASR a deterministic flush boundary for long utterances.
+The adapter uses 512-sample windows at 16 kHz and 256-sample windows at 8 kHz, matching Silero's supported sample rates while preserving streaming state between chunks. Continuous active speech is force-cut at `VAD_MAX_SPEECH_MS` by emitting `VADEnd`; in the current voice runtime this is a segment marker and does not close the ASR connection by itself.
 
 ### Voice Streaming
 
+Implemented/validated:
+
+- `DoubaoASR` follows the official `/home/liuxin/sauc_go` packet shape for audio-only messages: positive audio packets use flag `0b0001` with a positive sequence; the final audio packet uses flag `0b0011` with a negative sequence.
+- `DoubaoASR.Transcripts()` exposes partial/final service responses for realtime display while audio is still being uploaded.
+- `TestSileroVADToDoubaoASRRealService` runs a gated real-service smoke path: WAV -> Silero VAD -> multiple VAD chunks/segments -> one Doubao ASR connection -> one final transcript at whole-audio end.
+- WAV-file real-service tests pace packets by default with a `200ms` segment duration to match the official `sauc_go` ticker example. Disable with `VAD_ASR_REAL_PACE=false` or `DOUBAO_ASR_REAL_PACE=false` when intentionally stress-testing fast upload.
+
 Still needed:
 
-- Real Doubao ASR credential/service validation through `/v1/chat/voice`
-- Streaming TTS adapter
-- Barge-in / interruption control
-
-Current implemented endpoint is text-only for smoke testing.
+- Validate `/v1/chat/voice` end to end with a real WebSocket client and real microphone stream.
+- Streaming TTS adapter.
+- Barge-in / interruption control.
 
 ### Session/Event Storage
 
@@ -236,11 +241,18 @@ Still needed:
 
 ### Tests
 
-Current verification is compile/smoke level plus focused session wrapper unit tests:
+Current verification includes normal unit tests plus gated real-service ASR/VAD+ASR tests:
 
 ```bash
 go test ./...
-curl --noproxy '*' http://127.0.0.1:8080/healthz
+
+set -a
+source .env
+set +a
+
+VAD_ASR_REAL_TEST=1 \
+SILERO_VAD_MODEL_PATH=models/silero-vad/silero_vad.onnx \
+go test ./internal/voice -run TestSileroVADToDoubaoASRRealService -count=1 -v
 ```
 
 Still needed:

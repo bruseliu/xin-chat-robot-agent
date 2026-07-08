@@ -38,7 +38,7 @@ client audio stream
       -> client audio
 ```
 
-`internal/voice.VoiceSession` owns the VAD processor and ASR stream for one client connection. It writes only VAD-gated speech audio to ASR. When VAD emits `VADEnd`, the session finalizes ASR, then starts one ADK text turn with the final transcript.
+`internal/voice.VoiceSession` owns the VAD processor and ASR stream for one client connection. It writes only VAD-gated speech audio to ASR. `VADEnd` marks the end of one VAD speech segment, but it does not finalize ASR; multiple VAD segments can be written into the same ASR connection. The session finalizes ASR only when the client sends the whole-stream final control message, then starts one ADK text turn with the final transcript.
 
 `GET /v1/chat/voice` is the current WebSocket entry point. It expects `user_id` and optional `session_id`/`sample_rate` query parameters. Binary messages are treated as PCM16LE audio chunks; a text control message `{"type":"final"}` flushes the current audio stream. When ASR returns a final transcript, the server responds with a JSON `VoiceTurnOutput`.
 
@@ -58,14 +58,14 @@ START -> turn_context -> memory_context -> llm -> memory_commit
 
 Node payloads use text-first envelopes (`TurnContext`, `LLMInput`, `LLMOutput`) with optional `AttachmentRef` values. Image memory is not implemented now, but future image/audio/video blobs can be attached by reference without changing the reasoning graph shape.
 
-The current ASR provider implementation is `internal/voice.DoubaoASR`, a connection-scoped `StreamingASR` adapter for the Doubao/Volcengine WebSocket ASR protocol. It sends VAD-gated PCM audio chunks and finalizes the ASR stream when VAD emits `VADEnd`.
+The current ASR provider implementation is `internal/voice.DoubaoASR`, a connection-scoped `StreamingASR` adapter for the Doubao/Volcengine WebSocket ASR protocol. It sends VAD-gated PCM audio chunks, exposes partial/final ASR text through `Transcripts()`, and finalizes the ASR stream only at the end of the whole input stream.
 
 The next concrete replacements are:
 
 ```text
-WebSocket audio endpoint -> VoiceSession with per-connection VAD + DoubaoASR
 llm placeholder -> llmagent.New(...) or model-backed ADK runner path
 TTS placeholder -> transport-level streaming TTS adapter outside ADK graph
+/v1/chat/voice smoke path -> real microphone WebSocket client validation
 ```
 
 Then `NewADKService(...)` from `internal/memory/adk_service.go` can be passed to `runner.Config.MemoryService` so mem0 is available through ADK memory APIs.
@@ -120,9 +120,23 @@ Streaming detection and ASR-facing audio gating are implemented by `internal/vad
 - input formats: normalized `[]float32` or 16-bit little-endian mono PCM bytes
 - incomplete trailing samples remain in the same circular audio buffer until enough samples exist for the next inference window; full windows are not reprocessed
 - speech-start output requires 250 ms of continuous speech and includes the previous 800 ms of audio from a 5-second circular buffer plus the current speech-start chunk
-- continuous active speech is force-cut at `VAD_MAX_SPEECH_MS` by emitting `VADEnd`, so ASR can flush long utterances instead of buffering indefinitely
+- continuous active speech is force-cut at `VAD_MAX_SPEECH_MS` by emitting `VADEnd`; in the current voice runtime this marks a segment boundary and does not close the ASR connection by itself
 
-The stream keeps detector state across chunks and emits `SpeechStarted`, `SpeechEnded`, active state, segment timestamps, processed sample count, and buffered sample count. Three real speech fixtures are checked in under `internal/vad/testdata` and covered by `TestSileroDetectsSpeechFromRealWAV` in the default cgo build. That test writes detected VAD speech segments as WAV files under `tmp/vad-test-segments/<case-name>` by default; override with `VAD_SEGMENT_TEST_DIR` when you want a different inspection directory.
+`VADEnd` is a segment boundary, not an ASR connection boundary. The voice runtime can forward several `AudioOutput.Chunk` values across several VAD segments into one ASR connection and call `Finalize(...)` only when the full audio input is complete.
+
+Three real speech fixtures are checked in under `internal/vad/testdata` and covered by `TestSileroDetectsSpeechFromRealWAV` in the default cgo build. The full VAD+ASR real-service smoke test is gated by environment variables:
+
+```bash
+set -a
+source .env
+set +a
+
+VAD_ASR_REAL_TEST=1 \
+SILERO_VAD_MODEL_PATH=models/silero-vad/silero_vad.onnx \
+go test ./internal/voice -run TestSileroVADToDoubaoASRRealService -count=1 -v
+```
+
+That test uses the repo-local Silero VAD, writes all VAD-gated chunks from one WAV into a single Doubao ASR connection, logs partial ASR results from `DoubaoASR.Transcripts()`, then finalizes once at whole-audio end. For WAV-file testing it paces packets by default to match the official `sauc_go` sample's `segmentDuration` ticker; set `VAD_ASR_REAL_PACE=false` to disable pacing. `VAD_ASR_REAL_CHUNK_DURATION` controls chunk size and defaults to `200ms`.
 
 ## ADK Session Storage
 

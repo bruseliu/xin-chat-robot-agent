@@ -10,7 +10,7 @@ import (
 	"xin-chat-robot-agent/internal/vad"
 )
 
-func TestVoiceSessionWritesASRUntilVADEnd(t *testing.T) {
+func TestVoiceSessionWritesASRUntilFinalAudio(t *testing.T) {
 	pipeline := NewPipeline(&fakeRunner{}, &fakeMemory{}, slog.Default())
 	processor := &fakeVoiceVAD{out: vad.AudioOutput{
 		Chunk: vad.Chunk{Samples: []float32{0.1, 0.2}, SampleRate: 16000},
@@ -36,7 +36,31 @@ func TestVoiceSessionWritesASRUntilVADEnd(t *testing.T) {
 	}
 }
 
-func TestVoiceSessionRunsTextTurnOnFinalTranscript(t *testing.T) {
+func TestVoiceSessionDoesNotFinalizeASROnVADEnd(t *testing.T) {
+	pipeline := NewPipeline(&fakeRunner{}, &fakeMemory{}, slog.Default())
+	processor := &fakeVoiceVAD{out: vad.AudioOutput{
+		Chunk:  vad.Chunk{Samples: []float32{0.1}, SampleRate: 16000},
+		VADEnd: true,
+	}}
+	asr := &fakeStreamingASR{transcript: Transcript{Text: "你好"}}
+	session, err := NewVoiceSession(pipeline, processor, asr, VoiceSessionConfig{UserID: "alice", SessionID: "s1"})
+	if err != nil {
+		t.Fatalf("NewVoiceSession() error = %v", err)
+	}
+
+	out, err := session.ProcessAudio(context.Background(), AudioChunk{Samples: []float32{0.1}, SampleRate: 16000})
+	if err != nil {
+		t.Fatalf("ProcessAudio() error = %v", err)
+	}
+	if out.Final {
+		t.Fatal("Final = true, want false before whole audio final")
+	}
+	if asr.writes != 1 || asr.finalizes != 0 {
+		t.Fatalf("ASR writes/finalizes = %d/%d, want 1/0", asr.writes, asr.finalizes)
+	}
+}
+
+func TestVoiceSessionRunsTextTurnOnFinalAudio(t *testing.T) {
 	runner := &fakeRunner{}
 	pipeline := NewPipeline(runner, &fakeMemory{}, slog.Default())
 	processor := &fakeVoiceVAD{out: vad.AudioOutput{
@@ -49,7 +73,7 @@ func TestVoiceSessionRunsTextTurnOnFinalTranscript(t *testing.T) {
 		t.Fatalf("NewVoiceSession() error = %v", err)
 	}
 
-	out, err := session.ProcessAudio(context.Background(), AudioChunk{Samples: []float32{0.1}, SampleRate: 16000})
+	out, err := session.ProcessAudio(context.Background(), AudioChunk{Samples: []float32{0.1}, SampleRate: 16000, Final: true})
 	if err != nil {
 		t.Fatalf("ProcessAudio() error = %v", err)
 	}

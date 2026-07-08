@@ -31,9 +31,10 @@ const (
 	doubaoMsgServerAck         = 11
 	doubaoMsgServerError       = 15
 
-	doubaoFlagNoSequence       = 0
-	doubaoFlagPositiveSequence = 1
-	doubaoFlagNegativeSequence = 2
+	doubaoFlagNoSequence           = 0
+	doubaoFlagPositiveSequence     = 1
+	doubaoFlagNegativeSequence     = 2
+	doubaoFlagNegativeWithSequence = 3
 
 	doubaoSerializationNone = 0
 	doubaoSerializationJSON = 1
@@ -76,7 +77,8 @@ type DoubaoASR struct {
 	closed  bool
 	latest  Transcript
 
-	finalCh chan doubaoASRResult
+	finalCh      chan doubaoASRResult
+	transcriptCh chan Transcript
 }
 
 type doubaoASRResult struct {
@@ -111,7 +113,7 @@ func NewDoubaoASR(ctx context.Context, cfg DoubaoASRConfig) (*DoubaoASR, error) 
 		}
 		return nil, fmt.Errorf("doubao asr websocket dial: %w", err)
 	}
-	stream := &DoubaoASR{cfg: cfg, conn: conn, sequence: 1, finalCh: make(chan doubaoASRResult, 1)}
+	stream := &DoubaoASR{cfg: cfg, conn: conn, sequence: 1, finalCh: make(chan doubaoASRResult, 1), transcriptCh: make(chan Transcript, 32)}
 	if err := stream.sendInitialRequest(ctx); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -199,6 +201,13 @@ func (s *DoubaoASR) Write(ctx context.Context, chunk vad.Chunk) error {
 	return s.writeAudioPacketLocked(ctx, s.sequence, false, audio)
 }
 
+func (s *DoubaoASR) Transcripts() <-chan Transcript {
+	if s == nil {
+		return nil
+	}
+	return s.transcriptCh
+}
+
 func (s *DoubaoASR) Finalize(ctx context.Context) (Transcript, error) {
 	if s == nil {
 		return Transcript{}, fmt.Errorf("nil doubao asr")
@@ -272,14 +281,14 @@ func (s *DoubaoASR) sendInitialRequest(ctx context.Context) error {
 func (s *DoubaoASR) writeAudioPacketLocked(ctx context.Context, seq int32, final bool, audio []byte) error {
 	flags := doubaoFlagPositiveSequence
 	if final {
-		flags = doubaoFlagNegativeSequence
+		flags = doubaoFlagNegativeWithSequence
 		seq = -seq
 	}
 	compression := doubaoCompressionNone
 	if s.cfg.CompressAudio {
 		compression = doubaoCompressionGzip
 	}
-	packet, err := doubaoBuildPacket(doubaoMsgAudioOnlyRequest, flags, doubaoSerializationNone, compression, seq, audio)
+	packet, err := doubaoBuildAudioPacket(flags, compression, seq, audio)
 	if err != nil {
 		return err
 	}
@@ -296,6 +305,7 @@ func (s *DoubaoASR) writePacket(ctx context.Context, packet []byte) error {
 }
 
 func (s *DoubaoASR) readLoop() {
+	defer close(s.transcriptCh)
 	for {
 		_, data, err := s.conn.ReadMessage()
 		if err != nil {
@@ -314,10 +324,13 @@ func (s *DoubaoASR) readLoop() {
 			return
 		}
 		if resp.Text != "" {
-			s.updateLatest(Transcript{
+			transcript := Transcript{
 				Text:       resp.Text,
 				Confidence: resp.Confidence,
-			})
+				IsFinal:    resp.IsFinal,
+			}
+			s.updateLatest(transcript)
+			s.publishTranscript(transcript)
 		}
 		if resp.IsFinal {
 			latest := s.latestTranscript()
@@ -382,6 +395,13 @@ func (s *DoubaoASR) publishFinal(result doubaoASRResult) {
 	}
 }
 
+func (s *DoubaoASR) publishTranscript(transcript Transcript) {
+	select {
+	case s.transcriptCh <- transcript:
+	default:
+	}
+}
+
 type doubaoPacketResponse struct {
 	MessageType int
 	Sequence    int32
@@ -390,6 +410,26 @@ type doubaoPacketResponse struct {
 	IsFinal     bool
 	Error       string
 	Payload     map[string]any
+}
+
+func doubaoBuildAudioPacket(flags, compression int, seq int32, payload []byte) ([]byte, error) {
+	encoded := payload
+	var err error
+	if compression == doubaoCompressionGzip {
+		encoded, err = gzipBytes(payload)
+		if err != nil {
+			return nil, err
+		}
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, 12+len(encoded)))
+	buf.WriteByte(byte(doubaoProtocolVersion<<4 | doubaoHeaderSize))
+	buf.WriteByte(byte(doubaoMsgAudioOnlyRequest<<4 | flags))
+	buf.WriteByte(byte(doubaoSerializationNone<<4 | compression))
+	buf.WriteByte(0)
+	_ = binary.Write(buf, binary.BigEndian, seq)
+	_ = binary.Write(buf, binary.BigEndian, int32(len(encoded)))
+	buf.Write(encoded)
+	return buf.Bytes(), nil
 }
 
 func doubaoBuildPacket(messageType, flags, serialization, compression int, seq int32, payload []byte) ([]byte, error) {
@@ -406,7 +446,7 @@ func doubaoBuildPacket(messageType, flags, serialization, compression int, seq i
 	buf.WriteByte(byte(messageType<<4 | flags))
 	buf.WriteByte(byte(serialization<<4 | compression))
 	buf.WriteByte(0)
-	if flags == doubaoFlagPositiveSequence || flags == doubaoFlagNegativeSequence {
+	if flags&0x01 != 0 {
 		_ = binary.Write(buf, binary.BigEndian, seq)
 	}
 	_ = binary.Write(buf, binary.BigEndian, int32(len(encoded)))
@@ -428,14 +468,14 @@ func doubaoParsePacket(packet []byte) (doubaoPacketResponse, error) {
 	compression := int(packet[2] & 0x0f)
 	offset := headerSize
 	var seq int32
-	if flags == doubaoFlagPositiveSequence || flags == doubaoFlagNegativeSequence {
+	if flags&0x01 != 0 {
 		if len(packet) < offset+4 {
 			return doubaoPacketResponse{}, fmt.Errorf("invalid doubao asr response sequence")
 		}
 		seq = int32(binary.BigEndian.Uint32(packet[offset : offset+4]))
 		offset += 4
 	}
-	resp := doubaoPacketResponse{MessageType: messageType, Sequence: seq, IsFinal: seq < 0 || flags == doubaoFlagNegativeSequence}
+	resp := doubaoPacketResponse{MessageType: messageType, Sequence: seq, IsFinal: seq < 0 || flags&0x02 != 0}
 	if len(packet) == offset {
 		return resp, nil
 	}
@@ -483,7 +523,7 @@ func doubaoParsePacket(packet []byte) (doubaoPacketResponse, error) {
 	}
 	var body map[string]any
 	if err := json.Unmarshal(payload, &body); err != nil {
-		return doubaoPacketResponse{}, fmt.Errorf("decode doubao asr response: %w", err)
+		return doubaoPacketResponse{}, fmt.Errorf("decode doubao asr response: %w message_type=%d flags=%d serialization=%d compression=%d payload_head=%s", err, messageType, flags, serialization, compression, hex.EncodeToString(payload[:min(len(payload), 64)]))
 	}
 	resp.Payload = body
 	resp.Text = firstTextValue(body)

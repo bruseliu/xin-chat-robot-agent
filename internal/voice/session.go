@@ -22,8 +22,8 @@ type Transcript struct {
 }
 
 // StreamingASR is a connection-scoped ASR stream. Audio is written as VAD-gated
-// chunks. Finalize is called only when VAD emits VADEnd, and must return the
-// final transcript for the completed utterance.
+// chunks from one client audio stream. Finalize is called only when the
+// client audio stream ends, so multiple VAD segments can share one ASR connection.
 type StreamingASR interface {
 	Write(ctx context.Context, chunk vad.Chunk) error
 	Finalize(ctx context.Context) (Transcript, error)
@@ -51,6 +51,7 @@ type VoiceSession struct {
 	vad      vad.AudioProcessor
 	asr      StreamingASR
 	cfg      VoiceSessionConfig
+	asrWrote bool
 }
 
 func NewVoiceSession(pipeline *Pipeline, processor vad.AudioProcessor, asr StreamingASR, cfg VoiceSessionConfig) (*VoiceSession, error) {
@@ -91,9 +92,13 @@ func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (Voic
 		if err := s.asr.Write(ctx, vadOut.Chunk); err != nil {
 			return VoiceTurnOutput{}, err
 		}
+		s.asrWrote = true
 	}
-	if !vadOut.VADEnd {
+	if !chunk.Final {
 		return VoiceTurnOutput{Final: false}, nil
+	}
+	if !s.asrWrote {
+		return VoiceTurnOutput{Final: true}, nil
 	}
 
 	transcript, err := s.asr.Finalize(ctx)
@@ -131,6 +136,7 @@ func (s *VoiceSession) Reset() error {
 	if err := s.vad.Reset(); err != nil {
 		return err
 	}
+	s.asrWrote = false
 	return s.asr.Reset()
 }
 
