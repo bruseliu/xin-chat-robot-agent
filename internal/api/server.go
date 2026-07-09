@@ -135,15 +135,7 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 		writeWSError(conn, "vad_create_failed", err)
 		return
 	}
-	asr, err := s.asrFactory(r.Context())
-	if err != nil {
-		if processor != nil {
-			_ = processor.Close()
-		}
-		writeWSError(conn, "asr_create_failed", err)
-		return
-	}
-	session, err := voice.NewVoiceSession(s.pipeline, processor, asr, voice.VoiceSessionConfig{
+	session, err := voice.NewVoiceSessionWithASRFactory(r.Context(), s.pipeline, processor, voice.ASRFactory(s.asrFactory), voice.VoiceSessionConfig{
 		UserID:    userID,
 		SessionID: sessionID,
 		Metadata: map[string]string{
@@ -153,9 +145,6 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if processor != nil {
 			_ = processor.Close()
-		}
-		if asr != nil {
-			_ = asr.Close()
 		}
 		writeWSError(conn, "voice_session_create_failed", err)
 		return

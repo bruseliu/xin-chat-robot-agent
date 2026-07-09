@@ -16,8 +16,9 @@ type TextTurnInput struct {
 }
 
 type TextTurnOutput struct {
-	Text     string          `json:"text"`
-	Memories []memory.Memory `json:"memories,omitempty"`
+	Text     string              `json:"text"`
+	Events   []agent.StreamEvent `json:"events,omitempty"`
+	Memories []memory.Memory     `json:"memories,omitempty"`
 }
 
 type Pipeline struct {
@@ -35,6 +36,10 @@ func NewPipeline(agentRunner agent.Runner, store memory.Store, logger *slog.Logg
 }
 
 func (p *Pipeline) HandleTextTurn(ctx context.Context, input TextTurnInput) (TextTurnOutput, error) {
+	return p.HandleTextTurnStream(ctx, input, nil)
+}
+
+func (p *Pipeline) HandleTextTurnStream(ctx context.Context, input TextTurnInput, yield func(agent.StreamEvent) bool) (TextTurnOutput, error) {
 	memories, err := p.memory.Search(ctx, memory.SearchRequest{
 		UserID: input.UserID,
 		RunID:  input.SessionID,
@@ -45,12 +50,19 @@ func (p *Pipeline) HandleTextTurn(ctx context.Context, input TextTurnInput) (Tex
 		memories = nil
 	}
 
-	output, err := p.agent.RunTurn(ctx, agent.TurnInput{
+	events := make([]agent.StreamEvent, 0, 8)
+	output, err := p.agent.RunTurnStream(ctx, agent.TurnInput{
 		UserID:    input.UserID,
 		SessionID: input.SessionID,
 		Text:      input.Text,
 		Memories:  memories,
 		Metadata:  input.Metadata,
+	}, func(event agent.StreamEvent) bool {
+		events = append(events, event)
+		if yield == nil {
+			return true
+		}
+		return yield(event)
 	})
 	if err != nil {
 		return TextTurnOutput{}, err
@@ -60,6 +72,7 @@ func (p *Pipeline) HandleTextTurn(ctx context.Context, input TextTurnInput) (Tex
 
 	return TextTurnOutput{
 		Text:     output.Text,
+		Events:   events,
 		Memories: memories,
 	}, nil
 }

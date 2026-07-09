@@ -74,8 +74,16 @@ func (f *apiFakeASR) Close() error { return nil }
 
 type fakeAPIRunner struct{}
 
-func (fakeAPIRunner) RunTurn(_ context.Context, input agent.TurnInput) (agent.TurnOutput, error) {
-	return agent.TurnOutput{Text: "agent: " + input.Text}, nil
+func (fakeAPIRunner) RunTurn(ctx context.Context, input agent.TurnInput) (agent.TurnOutput, error) {
+	return fakeAPIRunner{}.RunTurnStream(ctx, input, nil)
+}
+
+func (fakeAPIRunner) RunTurnStream(_ context.Context, input agent.TurnInput, yield func(agent.StreamEvent) bool) (agent.TurnOutput, error) {
+	text := "agent: " + input.Text
+	if yield != nil {
+		yield(agent.StreamEvent{Type: agent.StreamEventLLMFinal, Text: text, Final: true})
+	}
+	return agent.TurnOutput{Text: text}, nil
 }
 
 type fakeAPIMemory struct{}

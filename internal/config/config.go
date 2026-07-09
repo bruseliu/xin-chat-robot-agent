@@ -12,6 +12,7 @@ type Config struct {
 	AgentID string
 	Mem0    Mem0Config
 	Session SessionConfig
+	LLM     LLMConfig
 	VAD     VADConfig
 	ASR     ASRConfig
 }
@@ -27,6 +28,17 @@ type Mem0Config struct {
 	APIKey  string
 	TopK    int
 	Timeout time.Duration
+}
+
+type LLMConfig struct {
+	Provider      string
+	GeminiAPIKey  string
+	GeminiModel   string
+	DoubaoBaseURL string
+	DoubaoAPIKey  string
+	DoubaoModel   string
+	DoubaoTimeout time.Duration
+	Instruction   string
 }
 
 type ASRConfig struct {
@@ -71,6 +83,16 @@ func Load() Config {
 			APIKey:  envString("MEM0_API_KEY", ""),
 			TopK:    envInt("MEM0_TOP_K", 8),
 			Timeout: time.Duration(envInt("MEM0_TIMEOUT_SECONDS", 10)) * time.Second,
+		},
+		LLM: LLMConfig{
+			Provider:      envString("LLM_PROVIDER", "none"),
+			GeminiAPIKey:  envString("GEMINI_API_KEY", envString("GOOGLE_API_KEY", "")),
+			GeminiModel:   envString("GEMINI_MODEL", "gemini-flash-latest"),
+			DoubaoBaseURL: envString("DOUBAO_LLM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"),
+			DoubaoAPIKey:  envString("DOUBAO_LLM_API_KEY", envString("ARK_API_KEY", "")),
+			DoubaoModel:   envString("DOUBAO_LLM_MODEL", ""),
+			DoubaoTimeout: time.Duration(envInt("DOUBAO_LLM_TIMEOUT_SECONDS", 60)) * time.Second,
+			Instruction:   envString("AGENT_INSTRUCTION", "You are a realtime voice assistant. Keep answers natural, concise, and suitable for TTS."),
 		},
 		VAD: VADConfig{
 			Provider:             envString("VAD_PROVIDER", "none"),

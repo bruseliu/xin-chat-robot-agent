@@ -21,15 +21,17 @@ type Transcript struct {
 	Confidence float64
 }
 
-// StreamingASR is a connection-scoped ASR stream. Audio is written as VAD-gated
-// chunks from one client audio stream. Finalize is called only when the
-// client audio stream ends, so multiple VAD segments can share one ASR connection.
+// StreamingASR is a segment-scoped ASR stream. Audio is written as VAD-gated
+// chunks for one VAD speech segment. Finalize is called when VAD emits VADEnd
+// or when the client closes the audio stream with pending speech.
 type StreamingASR interface {
 	Write(ctx context.Context, chunk vad.Chunk) error
 	Finalize(ctx context.Context) (Transcript, error)
 	Reset() error
 	Close() error
 }
+
+type ASRFactory func(ctx context.Context) (StreamingASR, error)
 
 type VoiceSessionConfig struct {
 	UserID    string
@@ -43,18 +45,34 @@ type VoiceTurnOutput struct {
 	Final      bool           `json:"final"`
 }
 
-// VoiceSession is the per-client-connection runtime. It owns VAD and ASR stream
-// state for the connection, then starts an ADK text turn only after ASR returns
-// a final transcript.
+// VoiceSession is the per-client-connection runtime. It owns VAD state for the
+// connection and a segment-scoped ASR stream. Every VAD end finalizes one ASR
+// segment and starts one ADK text turn from the final transcript.
 type VoiceSession struct {
-	pipeline *Pipeline
-	vad      vad.AudioProcessor
-	asr      StreamingASR
-	cfg      VoiceSessionConfig
-	asrWrote bool
+	pipeline   *Pipeline
+	vad        vad.AudioProcessor
+	asr        StreamingASR
+	asrFactory ASRFactory
+	cfg        VoiceSessionConfig
+	asrWrote   bool
 }
 
 func NewVoiceSession(pipeline *Pipeline, processor vad.AudioProcessor, asr StreamingASR, cfg VoiceSessionConfig) (*VoiceSession, error) {
+	return newVoiceSession(pipeline, processor, asr, nil, cfg)
+}
+
+func NewVoiceSessionWithASRFactory(ctx context.Context, pipeline *Pipeline, processor vad.AudioProcessor, factory ASRFactory, cfg VoiceSessionConfig) (*VoiceSession, error) {
+	if factory == nil {
+		return nil, fmt.Errorf("voice session requires ASR factory")
+	}
+	asr, err := factory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newVoiceSession(pipeline, processor, asr, factory, cfg)
+}
+
+func newVoiceSession(pipeline *Pipeline, processor vad.AudioProcessor, asr StreamingASR, factory ASRFactory, cfg VoiceSessionConfig) (*VoiceSession, error) {
 	if pipeline == nil {
 		return nil, fmt.Errorf("voice session requires pipeline")
 	}
@@ -68,10 +86,11 @@ func NewVoiceSession(pipeline *Pipeline, processor vad.AudioProcessor, asr Strea
 		return nil, fmt.Errorf("voice session requires user id")
 	}
 	return &VoiceSession{
-		pipeline: pipeline,
-		vad:      processor,
-		asr:      asr,
-		cfg:      cfg,
+		pipeline:   pipeline,
+		vad:        processor,
+		asr:        asr,
+		asrFactory: factory,
+		cfg:        cfg,
 	}, nil
 }
 
@@ -94,18 +113,34 @@ func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (Voic
 		}
 		s.asrWrote = true
 	}
-	if !chunk.Final {
-		return VoiceTurnOutput{Final: false}, nil
+	if vadOut.VADEnd {
+		return s.finalizeASRTurn(ctx, chunk.Final)
 	}
-	if !s.asrWrote {
-		return VoiceTurnOutput{Final: true}, nil
+	if chunk.Final {
+		if !s.asrWrote {
+			return VoiceTurnOutput{Final: true}, nil
+		}
+		return s.finalizeASRTurn(ctx, true)
 	}
+	return VoiceTurnOutput{Final: false}, nil
+}
 
+func (s *VoiceSession) finalizeASRTurn(ctx context.Context, streamFinal bool) (VoiceTurnOutput, error) {
+	if !s.asrWrote {
+		return VoiceTurnOutput{Final: streamFinal}, nil
+	}
 	transcript, err := s.asr.Finalize(ctx)
 	if err != nil {
 		return VoiceTurnOutput{}, err
 	}
 	transcript.IsFinal = true
+	s.asrWrote = false
+	if streamFinal {
+		_ = s.asr.Close()
+	} else if err := s.rotateASR(ctx); err != nil {
+		return VoiceTurnOutput{}, err
+	}
+
 	text := strings.TrimSpace(transcript.Text)
 	if text == "" {
 		return VoiceTurnOutput{Transcript: transcript, Final: true}, nil
@@ -127,6 +162,21 @@ func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (Voic
 		Response:   response,
 		Final:      true,
 	}, nil
+}
+
+func (s *VoiceSession) rotateASR(ctx context.Context) error {
+	if s.asrFactory == nil {
+		return s.asr.Reset()
+	}
+	if s.asr != nil {
+		_ = s.asr.Close()
+	}
+	next, err := s.asrFactory(ctx)
+	if err != nil {
+		return err
+	}
+	s.asr = next
+	return nil
 }
 
 func (s *VoiceSession) Reset() error {

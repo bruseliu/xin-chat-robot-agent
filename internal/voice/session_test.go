@@ -36,8 +36,9 @@ func TestVoiceSessionWritesASRUntilFinalAudio(t *testing.T) {
 	}
 }
 
-func TestVoiceSessionDoesNotFinalizeASROnVADEnd(t *testing.T) {
-	pipeline := NewPipeline(&fakeRunner{}, &fakeMemory{}, slog.Default())
+func TestVoiceSessionFinalizesASROnVADEnd(t *testing.T) {
+	runner := &fakeRunner{}
+	pipeline := NewPipeline(runner, &fakeMemory{}, slog.Default())
 	processor := &fakeVoiceVAD{out: vad.AudioOutput{
 		Chunk:  vad.Chunk{Samples: []float32{0.1}, SampleRate: 16000},
 		VADEnd: true,
@@ -52,11 +53,52 @@ func TestVoiceSessionDoesNotFinalizeASROnVADEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessAudio() error = %v", err)
 	}
-	if out.Final {
-		t.Fatal("Final = true, want false before whole audio final")
+	if !out.Final {
+		t.Fatal("Final = false, want true for VAD turn")
 	}
-	if asr.writes != 1 || asr.finalizes != 0 {
-		t.Fatalf("ASR writes/finalizes = %d/%d, want 1/0", asr.writes, asr.finalizes)
+	if out.Response.Text != "agent: 你好" {
+		t.Fatalf("response text = %q, want agent response", out.Response.Text)
+	}
+	if asr.writes != 1 || asr.finalizes != 1 {
+		t.Fatalf("ASR writes/finalizes = %d/%d, want 1/1", asr.writes, asr.finalizes)
+	}
+	if runner.calls != 1 || runner.last.Text != "你好" {
+		t.Fatalf("runner calls/text = %d/%q, want 1/你好", runner.calls, runner.last.Text)
+	}
+}
+
+func TestVoiceSessionRotatesASRAfterVADEnd(t *testing.T) {
+	runner := &fakeRunner{}
+	pipeline := NewPipeline(runner, &fakeMemory{}, slog.Default())
+	processor := &fakeVoiceVAD{out: vad.AudioOutput{
+		Chunk:  vad.Chunk{Samples: []float32{0.1}, SampleRate: 16000},
+		VADEnd: true,
+	}}
+	streams := []*fakeStreamingASR{
+		{transcript: Transcript{Text: "第一句"}},
+		{transcript: Transcript{Text: "第二句"}},
+		{transcript: Transcript{Text: "第三句"}},
+	}
+	idx := 0
+	session, err := NewVoiceSessionWithASRFactory(context.Background(), pipeline, processor, func(context.Context) (StreamingASR, error) {
+		stream := streams[idx]
+		idx++
+		return stream, nil
+	}, VoiceSessionConfig{UserID: "alice", SessionID: "s1"})
+	if err != nil {
+		t.Fatalf("NewVoiceSessionWithASRFactory() error = %v", err)
+	}
+
+	for range 2 {
+		if _, err := session.ProcessAudio(context.Background(), AudioChunk{Samples: []float32{0.1}, SampleRate: 16000}); err != nil {
+			t.Fatalf("ProcessAudio() error = %v", err)
+		}
+	}
+	if runner.calls != 2 {
+		t.Fatalf("runner calls = %d, want 2", runner.calls)
+	}
+	if streams[0].finalizes != 1 || streams[1].finalizes != 1 {
+		t.Fatalf("stream finalizes = %d/%d, want 1/1", streams[0].finalizes, streams[1].finalizes)
 	}
 }
 
@@ -132,10 +174,18 @@ type fakeRunner struct {
 	last  agent.TurnInput
 }
 
-func (f *fakeRunner) RunTurn(_ context.Context, input agent.TurnInput) (agent.TurnOutput, error) {
+func (f *fakeRunner) RunTurn(ctx context.Context, input agent.TurnInput) (agent.TurnOutput, error) {
+	return f.RunTurnStream(ctx, input, nil)
+}
+
+func (f *fakeRunner) RunTurnStream(_ context.Context, input agent.TurnInput, yield func(agent.StreamEvent) bool) (agent.TurnOutput, error) {
 	f.calls++
 	f.last = input
-	return agent.TurnOutput{Text: "agent: " + input.Text}, nil
+	text := "agent: " + input.Text
+	if yield != nil {
+		yield(agent.StreamEvent{Type: agent.StreamEventLLMFinal, Text: text, Final: true})
+	}
+	return agent.TurnOutput{Text: text}, nil
 }
 
 type fakeMemory struct{}

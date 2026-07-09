@@ -54,11 +54,22 @@ func main() {
 		logger.Info("adk graph", "edge", line)
 	}
 
-	agentRunner := agent.NewADKRunner(agent.Config{
+	rootAgent, err := newLLMAgent(context.Background(), cfg.LLM, cfg.AgentID)
+	if err != nil {
+		logger.Error("create ADK LLM agent failed", "error", err)
+		os.Exit(1)
+	}
+
+	agentRunner, err := agent.NewADKRunner(agent.Config{
 		AgentID:        cfg.AgentID,
+		RootAgent:      rootAgent,
 		SessionService: sessionService,
 		MemoryService:  adkMemoryService,
 	}, memClient, logger)
+	if err != nil {
+		logger.Error("create ADK runner failed", "error", err)
+		os.Exit(1)
+	}
 
 	pipeline := voice.NewPipeline(agentRunner, memClient, logger)
 	server := api.NewServer(api.Config{

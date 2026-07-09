@@ -214,8 +214,7 @@ curl -X POST http://localhost:8080/v1/chat/text \
 
 ## Next Work
 
-1. Replace `echoPlanner` with a real ADK 2.0 Go runner.
-2. Validate `/v1/chat/voice` against the real Doubao ASR service.
-3. Implement streaming TTS adapter.
-4. Replace `echoPlanner` with a real ADK runner using the configured PostgreSQL SessionService and mem0 MemoryService.
-4. Replace `echoPlanner` path with real ADK runner using the configured PostgreSQL SessionService and mem0 MemoryService.
+1. Replace `echoPlanner` with a real ADK 2.0 Go runner using the configured PostgreSQL SessionService and mem0 MemoryService.
+2. Validate `/v1/chat/voice` against a real microphone WebSocket client.
+3. Implement the streaming TTS adapter outside the ADK graph.
+4. Add barge-in / interruption control.
