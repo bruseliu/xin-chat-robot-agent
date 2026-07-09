@@ -225,8 +225,19 @@ Implemented/validated:
 - `TestSileroVADToDoubaoASRRealService` runs a gated real-service smoke path: WAV -> Silero VAD -> multiple VAD chunks/segments -> one Doubao ASR connection -> one final transcript at whole-audio end.
 - WAV-file real-service tests pace packets by default with a `200ms` segment duration to match the official `sauc_go` ticker example. Disable with `VAD_ASR_REAL_PACE=false` or `DOUBAO_ASR_REAL_PACE=false` when intentionally stress-testing fast upload.
 
+Current ASR product direction:
+
+- The target voice UX is now a single long-lived ASR connection per client microphone stream. The ASR provider should perform endpointing/sentence detection, emit a final result for each spoken sentence, and only close the recognition task when the client stops the whole audio stream.
+- This shifts the preferred path away from local VAD-gated ASR segments. Local VAD/Silero can remain available as an optional gate or fallback, but the main provider integration should support service-side sentence boundaries from the raw microphone stream, including silence.
+- Alibaba Cloud NLS `SpeechTranscriber` is the best protocol match found so far: one WebSocket, `StartTranscription`, continuous binary audio frames, `SentenceBegin` / `TranscriptionResultChanged` / `SentenceEnd`, then `StopTranscription` / `TranscriptionCompleted`. `SentenceEnd` maps directly to a user utterance final transcript, while `TranscriptionCompleted` maps to whole-stream shutdown.
+- Tencent Cloud ASR WebSocket is also viable for this no-local-VAD mode. It exposes `result.slice_type=2` for a stable sentence/end-of-utterance result and top-level `final=1` for the whole audio stream after sending `{"type":"end"}`. Configure Tencent service-side endpointing with `needvad=1` and `vad_silence_time`.
+- iFlytek RTASR is a possible secondary option. It uses a long WebSocket stream with result `type=0` for final results and a final `{"end": true}` upload marker for whole-stream completion. Its event model is less explicit than Alibaba NLS `SentenceEnd`.
+- Doubao/Volcengine SAUC remains implemented, but it is not the preferred fit for the updated requirement until a real-service smoke test proves stable multi-sentence final events on one connection without using client-side negative sequence packets as per-segment endings. The current adapter is still useful for segment-scoped or whole-stream finalization.
+
 Still needed:
 
+- Choose and implement the primary service-side endpointing ASR provider, with Alibaba NLS as the current default recommendation and Tencent Cloud ASR as the next candidate.
+- Adjust `VoiceSession` so service-side sentence final events can trigger one text turn while the ASR connection remains open until whole-stream completion.
 - Validate `/v1/chat/voice` end to end with a real WebSocket client and real microphone stream.
 - Streaming TTS adapter.
 - Barge-in / interruption control.
