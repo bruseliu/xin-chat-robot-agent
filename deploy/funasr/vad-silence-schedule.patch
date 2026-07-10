@@ -1,0 +1,23 @@
+diff --git a/serve_realtime_ws.py b/serve_realtime_ws.py
+--- a/serve_realtime_ws.py
++++ b/serve_realtime_ws.py
+@@ -443,7 +443,16 @@ async def handle_client(websocket, args):
+     vllm_engine, asr_kwargs, vad_model, spk_model = load_models(args)
+-    vad = DynamicStreamingVAD(vad_model)
++    silence_schedule = None
++    if args.vad_silence_schedule:
++        pairs = args.vad_silence_schedule.split(",")
++        silence_schedule = []
++        for pair in pairs:
++            limit_s, silence_ms_s = pair.split(":")
++            limit = float(limit_s)
++            silence_schedule.append((limit, int(silence_ms_s)))
++    vad = DynamicStreamingVAD(vad_model, silence_schedule=silence_schedule)
+     spk_tracker = None if args.disable_spk else HybridSpeakerTracker(spk_model, args.device)
+     session = RealtimeASRSession(vllm_engine, asr_kwargs, vad, spk_tracker=spk_tracker)
+@@ -545,6 +554,8 @@ def parse_args():
+     parser.add_argument("--max-model-len", type=int, default=2048)
++    parser.add_argument("--vad-silence-schedule", type=str, default=None,
++                        help="VAD silence schedule: 'limit_ms:silence_ms,...' e.g. '3000:800,8000:500,inf:300'")
+
+     return parser.parse_args()

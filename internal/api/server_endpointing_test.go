@@ -42,14 +42,16 @@ func TestVoiceWebSocketStreamsProviderSentenceEnd(t *testing.T) {
 	if err := conn.ReadJSON(&response); err != nil {
 		t.Fatalf("ReadJSON() error = %v", err)
 	}
-	if response.Transcript.Text != "FunASR句末" || response.Response.Text != "agent: FunASR句末" || !response.Final {
+	if response.Type != "sentence" || response.Transcript.Text != "FunASR句末" || response.Response.Text != "agent: FunASR句末" || !response.Final {
 		t.Fatalf("response = %+v", response)
 	}
 }
 
 type apiServerEndpointingASR struct {
-	sentences chan voice.Transcript
-	closeOnce sync.Once
+	sentences    chan voice.Transcript
+	partials     chan voice.Transcript
+	partialsOnce sync.Once
+	closeOnce    sync.Once
 }
 
 func (f *apiServerEndpointingASR) Write(context.Context, vad.Chunk) error {
@@ -73,4 +75,12 @@ func (f *apiServerEndpointingASR) Close() error {
 
 func (f *apiServerEndpointingASR) SentenceTranscripts() <-chan voice.Transcript {
 	return f.sentences
+}
+
+func (f *apiServerEndpointingASR) PartialTranscripts() <-chan voice.Transcript {
+	f.partialsOnce.Do(func() {
+		f.partials = make(chan voice.Transcript)
+		close(f.partials)
+	})
+	return f.partials
 }

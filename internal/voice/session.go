@@ -16,9 +16,10 @@ type AudioChunk struct {
 }
 
 type Transcript struct {
-	Text       string
-	IsFinal    bool
-	Confidence float64
+	Text       string  `json:"text"`
+	IsFinal    bool    `json:"is_final,omitempty"`
+	IsPartial  bool    `json:"is_partial,omitempty"`
+	Confidence float64 `json:"confidence,omitempty"`
 }
 
 // StreamingASR is a connection-scoped ASR stream. Legacy providers can use VAD
@@ -35,6 +36,14 @@ type StreamingASR interface {
 type ServerEndpointingASR interface {
 	StreamingASR
 	SentenceTranscripts() <-chan Transcript
+	PartialTranscripts() <-chan Transcript
+}
+
+// SegmentEndNotifier is optionally implemented by ServerEndpointingASR providers
+// that support a "segment end" signal from the client's local VAD. The provider
+// force-decodes the current audio as a sentence without closing the connection.
+type SegmentEndNotifier interface {
+	NotifySegmentEnd(ctx context.Context) error
 }
 
 type ASRFactory func(ctx context.Context) (StreamingASR, error)
@@ -46,6 +55,7 @@ type VoiceSessionConfig struct {
 }
 
 type VoiceTurnOutput struct {
+	Type       string         `json:"type"`
 	Transcript Transcript     `json:"transcript"`
 	Response   TextTurnOutput `json:"response,omitempty"`
 	Final      bool           `json:"final"`
@@ -124,15 +134,36 @@ func (s *VoiceSession) Outputs() <-chan VoiceTurnOutput {
 
 func (s *VoiceSession) consumeServerEndpointingTranscripts() {
 	defer close(s.outputs)
-	for transcript := range s.endpointing.SentenceTranscripts() {
-		if !transcript.IsFinal || strings.TrimSpace(transcript.Text) == "" {
-			continue
+	sentences := s.endpointing.SentenceTranscripts()
+	partials := s.endpointing.PartialTranscripts()
+
+	for sentences != nil || partials != nil {
+		select {
+		case transcript, ok := <-sentences:
+			if !ok {
+				sentences = nil
+				continue
+			}
+			if !transcript.IsFinal || strings.TrimSpace(transcript.Text) == "" {
+				continue
+			}
+			output, err := s.runTextTurn(s.ctx, transcript)
+			if err != nil {
+				output = VoiceTurnOutput{Type: "sentence", Transcript: transcript, Final: true, Error: err.Error()}
+			} else {
+				output.Type = "sentence"
+			}
+			s.outputs <- output
+		case partial, ok := <-partials:
+			if !ok {
+				partials = nil
+				continue
+			}
+			if strings.TrimSpace(partial.Text) == "" {
+				continue
+			}
+			s.outputs <- VoiceTurnOutput{Type: "partial", Transcript: partial}
 		}
-		output, err := s.runTextTurn(s.ctx, transcript)
-		if err != nil {
-			output = VoiceTurnOutput{Transcript: transcript, Final: true, Error: err.Error()}
-		}
-		s.outputs <- output
 	}
 }
 
@@ -177,6 +208,13 @@ func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (Voic
 				return VoiceTurnOutput{}, err
 			}
 			return VoiceTurnOutput{Final: true}, nil
+		}
+		if vadOut.VADEnd {
+			if notifier, ok := s.endpointing.(SegmentEndNotifier); ok {
+				if err := notifier.NotifySegmentEnd(ctx); err != nil {
+					return VoiceTurnOutput{}, err
+				}
+			}
 		}
 		return VoiceTurnOutput{Final: false}, nil
 	}

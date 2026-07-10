@@ -18,6 +18,14 @@ fi
 export FUNASR_BIND_HOST="${FUNASR_BIND_HOST:-127.0.0.1}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
+vad_extra_args=()
+if [[ -n "${FUNASR_VAD_SILENCE_SCHEDULE:-}" ]]; then
+  vad_extra_args+=(--vad-silence-schedule "$FUNASR_VAD_SILENCE_SCHEDULE")
+fi
+if [[ -n "${FUNASR_VAD_SPEECH_NOISE_THRES:-}" ]]; then
+  vad_extra_args+=(--vad-speech-noise-thres "$FUNASR_VAD_SPEECH_NOISE_THRES")
+fi
+
 exec "${FUNASR_PYTHON:-python3}" "$FUNASR_HOME/serve_realtime_ws.py" \
   --port "${FUNASR_PORT:-10095}" \
   --language "${FUNASR_LANGUAGE:-中文}" \
@@ -27,4 +35,5 @@ exec "${FUNASR_PYTHON:-python3}" "$FUNASR_HOME/serve_realtime_ws.py" \
   --gpu-memory-utilization "${FUNASR_GPU_MEMORY_UTILIZATION:-0.7}" \
   --decode-interval "${FUNASR_DECODE_INTERVAL_SECONDS:-0.8}" \
   --ws-ping-interval "${FUNASR_WS_PING_INTERVAL_SECONDS:-20}" \
-  --ws-ping-timeout "${FUNASR_WS_PING_TIMEOUT_SECONDS:-60}"
+  --ws-ping-timeout "${FUNASR_WS_PING_TIMEOUT_SECONDS:-60}" \
+  "${vad_extra_args[@]+${vad_extra_args[@]}}"

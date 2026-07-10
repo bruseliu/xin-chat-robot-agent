@@ -16,7 +16,7 @@ func TestVoiceSessionUsesProviderSentenceEndWithoutRotatingASR(t *testing.T) {
 		Chunk:  vad.Chunk{Samples: []float32{0.1}, SampleRate: 16000},
 		VADEnd: true,
 	}}
-	asr := &fakeServerEndpointingASR{sentences: make(chan Transcript, 2)}
+	asr := &fakeServerEndpointingASR{sentences: make(chan Transcript, 2), partials: make(chan Transcript, 2)}
 	session, err := NewVoiceSession(pipeline, processor, asr, VoiceSessionConfig{UserID: "alice", SessionID: "s1"})
 	if err != nil {
 		t.Fatalf("NewVoiceSession() error = %v", err)
@@ -38,7 +38,7 @@ func TestVoiceSessionUsesProviderSentenceEndWithoutRotatingASR(t *testing.T) {
 	asr.sentences <- Transcript{Text: "你好世界", IsFinal: true}
 	select {
 	case result := <-session.Outputs():
-		if result.Transcript.Text != "你好世界" || result.Response.Text != "agent: 你好世界" || !result.Final {
+		if result.Type != "sentence" || result.Transcript.Text != "你好世界" || result.Response.Text != "agent: 你好世界" || !result.Final {
 			t.Fatalf("provider sentence output = %+v", result)
 		}
 	case <-time.After(time.Second):
@@ -49,10 +49,12 @@ func TestVoiceSessionUsesProviderSentenceEndWithoutRotatingASR(t *testing.T) {
 	}
 
 	close(asr.sentences)
+	close(asr.partials)
 }
 
 type fakeServerEndpointingASR struct {
 	sentences chan Transcript
+	partials  chan Transcript
 	writes    int
 	finalizes int
 }
@@ -72,4 +74,13 @@ func (f *fakeServerEndpointingASR) Close() error { return nil }
 
 func (f *fakeServerEndpointingASR) SentenceTranscripts() <-chan Transcript {
 	return f.sentences
+}
+
+func (f *fakeServerEndpointingASR) PartialTranscripts() <-chan Transcript {
+	if f.partials == nil {
+		ch := make(chan Transcript)
+		close(ch)
+		return ch
+	}
+	return f.partials
 }

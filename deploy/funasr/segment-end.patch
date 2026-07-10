@@ -1,0 +1,17 @@
+--- a/serve_realtime_ws.py
++++ b/serve_realtime_ws.py
+
+ Adds SEGMENT_END WebSocket command to the FunASR streaming server.
+
+ When the client's local VAD detects end-of-speech, it sends "SEGMENT_END"
+ (text message). The server force-decodes the current audio segment, locks it
+ as a sentence, resets VAD state, and continues accepting audio on the same
+ connection. This avoids reconnection overhead while using the client's
+ superior VAD for sentence boundary detection.
+
+ Protocol:
+   START → binary audio... → SEGMENT_END → (sentence returned) → binary audio... → STOP
+
+ Changes:
+ 1. RealtimeASRSession.force_segment_end() method
+ 2. handle_client: SEGMENT_END command handler (responds with event="segment_end")

@@ -38,6 +38,7 @@ type FunASRASR struct {
 	latest   Transcript
 
 	sentences chan Transcript
+	partials  chan Transcript
 	completed chan error
 	seen      map[string]struct{}
 }
@@ -64,6 +65,7 @@ func NewFunASRASR(ctx context.Context, cfg FunASRASRConfig) (*FunASRASR, error) 
 		cfg:       cfg,
 		conn:      conn,
 		sentences: make(chan Transcript, 32),
+		partials:  make(chan Transcript, 16),
 		completed: make(chan error, 1),
 		seen:      make(map[string]struct{}),
 	}
@@ -144,6 +146,31 @@ func (s *FunASRASR) SentenceTranscripts() <-chan Transcript {
 	return s.sentences
 }
 
+func (s *FunASRASR) PartialTranscripts() <-chan Transcript {
+	if s == nil {
+		return nil
+	}
+	return s.partials
+}
+
+// NotifySegmentEnd tells the server that local VAD detected end-of-speech.
+// The server force-decodes the current segment and returns a sentence without
+// closing the connection.
+func (s *FunASRASR) NotifySegmentEnd(ctx context.Context) error {
+	if s == nil {
+		return fmt.Errorf("nil funasr asr")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.isClosed() {
+		return fmt.Errorf("funasr stream is closed")
+	}
+	if s.isStopping() {
+		return fmt.Errorf("funasr stream is stopping")
+	}
+	return s.writeMessage(ctx, websocket.TextMessage, []byte("SEGMENT_END"))
+}
+
 func (s *FunASRASR) Finalize(ctx context.Context) (Transcript, error) {
 	if s == nil {
 		return Transcript{}, fmt.Errorf("nil funasr asr")
@@ -212,6 +239,7 @@ func (s *FunASRASR) waitStarted(ctx context.Context) error {
 
 func (s *FunASRASR) readLoop() {
 	defer close(s.sentences)
+	defer close(s.partials)
 	for {
 		messageType, data, err := s.conn.ReadMessage()
 		if err != nil {
@@ -236,6 +264,9 @@ func (s *FunASRASR) readLoop() {
 		for _, sentence := range response.Sentences {
 			s.publishSentence(sentence)
 		}
+		if response.Partial != "" {
+			s.publishPartial(response.Partial)
+		}
 		if response.Event == "stopped" || response.IsFinal {
 			s.publishCompleted(nil)
 			if response.Event == "stopped" {
@@ -259,6 +290,18 @@ func (s *FunASRASR) publishSentence(sentence funASRSentence) {
 	s.updateLatest(transcript)
 	select {
 	case s.sentences <- transcript:
+	default:
+	}
+}
+
+func (s *FunASRASR) publishPartial(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	transcript := Transcript{Text: text, IsPartial: true}
+	select {
+	case s.partials <- transcript:
 	default:
 	}
 }
@@ -334,6 +377,8 @@ type funASRResponse struct {
 	Partial   string           `json:"partial"`
 	IsFinal   bool             `json:"is_final"`
 	Error     string           `json:"error"`
+	// segment_end event is handled like a normal decode response —
+	// sentences in the payload are published normally.
 }
 
 type funASRSentence struct {

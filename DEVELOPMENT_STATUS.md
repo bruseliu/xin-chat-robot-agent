@@ -241,6 +241,255 @@ Implemented:
 - `deploy/funasr/run-funasr-nano.sh` starts the official service with one GPU, loopback-only binding, and a vLLM sampler compatible with hosts that lack `nvcc`; a real 16 kHz WAV smoke test has verified final sentence output from the local service.
 - `VoiceSession` keeps the FunASR connection open across locked sentences and starts one text turn for each new sentence.
 - `VAD_PROVIDER=passthrough` forwards raw microphone PCM, including silence, so FunASR performs endpointing.
+- Partial transcript streaming: `FunASRASR` and `AliyunNLSASR` both implement `PartialTranscripts() <-chan Transcript`. `VoiceSession.consumeServerEndpointingTranscripts` selects on both sentences and partials channels, emitting `VoiceTurnOutput{Type: "partial"}` for real-time display.
+
+### Hybrid VAD + SEGMENT_END (2026-07-10)
+
+**Problem**: FunASR 内置的 FSMN-VAD 在带噪音的音频上无法检测静音帧（神经网络模型限制，不是参数问题 — 即使 `speech_noise_thres=0.1` + `silence_schedule=[(inf, 200)]` 也不行）。而用 `STOP` + 重连的方式每句有建连开销（WebSocket 握手 + START 等待）。
+
+**设计决策**: 区分"VAD 断句"和"音频流结束"为两个独立概念：
+- `SEGMENT_END`（文本消息）= 客户端本地 VAD 检测到一句话说完了，要求服务端 decode 当前段并返回 sentence，但连接不断
+- `STOP`（文本消息）= 整个音频会话结束，关闭连接
+
+**协议流程**:
+```
+客户端                              服务端
+  |-- START ----------------------->|
+  |<-- {"event":"started"} ---------|
+  |-- binary PCM (speech) --------->|  (Silero VAD 检测到语音，发送音频)
+  |<-- {"partial":"一二三..."} ------|  (定时 decode 返回中间结果)
+  |-- SEGMENT_END ----------------->|  (Silero VAD 检测到 speech end)
+  |<-- {"event":"segment_end",      |  (服务端 force decode + lock sentence)
+  |     "sentences":[...]} ---------|
+  |-- binary PCM (next speech) ---->|  (下一段语音，同一连接)
+  |<-- {"partial":"你好..."} --------|
+  |-- SEGMENT_END ----------------->|
+  |<-- {"event":"segment_end",...} --|
+  |-- STOP ------------------------>|  (会话彻底结束)
+  |<-- {"is_final":true,...} --------|
+  |<-- {"event":"stopped"} ---------|
+```
+
+**注意**: `segment_end` 响应中的 `sentences` 数组是**累积的**（包含本次会话所有已 lock 的句子），客户端需要去重。Go 客户端通过 `seen` map（key = `start:end:text`）做去重。
+
+---
+
+#### 服务端改动 (`/data/liuxin/Fun-ASR/serve_realtime_ws.py`)
+
+Git commit: `3f95db6` on `/data/liuxin/Fun-ASR` main branch.
+
+**1. `RealtimeASRSession.force_segment_end()` 方法** (line ~386):
+
+```python
+def force_segment_end(self):
+    # 如果当前没有活跃语音段，直接返回
+    if self.vad.current_speech_start is None:
+        return self._build_response(is_final=False)
+
+    # 计算当前段的 end 时间 = buffer 总长度对应的毫秒数
+    end_ms = int(len(self.audio_buffer) * 1000 / self.sample_rate)
+    seg = [self.vad.current_speech_start, end_ms]
+
+    # 用 vLLM 推理 decode 整个段
+    seg_text = self._decode_segment(seg)
+    if seg_text.strip():
+        self.locked_sentences.append({"text": seg_text, "start": int(seg[0]), "end": int(seg[1])})
+
+    # 重置 VAD 状态，为下一段做准备
+    self.vad.current_speech_start = None
+    self.prev_text = ""
+    self.last_partial_text = ""
+    self.first_decode_done = False
+    self._force_speech_on_next_audio = True  # 关键：下一个 audio 进来直接 mark speech start
+    return self._build_response(is_final=False)
+```
+
+**2. `_force_speech_on_next_audio` 机制** (line ~253 in `add_audio`):
+
+SEGMENT_END 之后 FSMN-VAD 的 `current_speech_start` 被清空了。如果等 FSMN-VAD 自己重新检测 speech start，在噪音音频上它永远检不到。所以加了一个 flag：下一个 audio chunk 到达时，立即设置 `current_speech_start = 当前位置`，不依赖 FSMN-VAD。
+
+```python
+def add_audio(self, pcm_bytes):
+    ...
+    if self._force_speech_on_next_audio and self.vad.current_speech_start is None:
+        self.vad.current_speech_start = <当前 buffer 位置对应的 ms>
+        self._force_speech_on_next_audio = False
+    ...
+```
+
+这在"客户端用 Silero VAD gate 音频、只发 speech 帧"的场景下是正确的 — SEGMENT_END 之后到达的下一个 audio 一定是新语音。
+
+**3. `handle_client` 命令处理** (line ~514):
+
+```python
+elif cmd.upper() == "SEGMENT_END":
+    if session.is_active:
+        result = await asyncio.to_thread(session.force_segment_end)
+        result["event"] = "segment_end"
+        await websocket.send(json.dumps(result))
+```
+
+**4. 其他改动** (同一 commit):
+- `--vad-silence-schedule` 参数：动态 silence 检测时长，格式 `limit_ms:silence_ms,...`（例如 `inf:200`）
+- `--vad-speech-noise-thres` 参数：FSMN-VAD 语音/噪声阈值（默认 0.5，越低越敏感）
+- 绑定 `FUNASR_BIND_HOST` 环境变量（默认 `127.0.0.1`，不再 `0.0.0.0`）
+
+---
+
+#### Go 客户端改动 (`internal/voice/funasr_asr.go`)
+
+**`NotifySegmentEnd` 方法**:
+
+```go
+func (s *FunASRASR) NotifySegmentEnd(ctx context.Context) error {
+    s.writeMu.Lock()
+    defer s.writeMu.Unlock()
+    if s.isClosed() || s.isStopping() {
+        return fmt.Errorf("funasr stream not available")
+    }
+    return s.writeMessage(ctx, websocket.TextMessage, []byte("SEGMENT_END"))
+}
+```
+
+**去重逻辑** (已有，在 `publishSentence` 中):
+
+```go
+func (s *FunASRASR) publishSentence(sentence funASRSentence) {
+    key := fmt.Sprintf("%d:%d:%s", sentence.Start, sentence.End, text)
+    if _, seen := s.seen[key]; seen {
+        return  // 跳过重复
+    }
+    s.seen[key] = struct{}{}
+    // ... 发送到 sentences channel
+}
+```
+
+`readLoop` 中 `segment_end` 事件的 sentences 会走正常的 `publishSentence` 路径，自动去重。
+
+---
+
+#### Session 集成 (`internal/voice/session.go`)
+
+**新增接口**:
+
+```go
+// SegmentEndNotifier 由支持客户端 VAD 驱动断句的 ASR provider 实现
+type SegmentEndNotifier interface {
+    NotifySegmentEnd(ctx context.Context) error
+}
+```
+
+**ProcessAudio 中的逻辑** (endpointing 模式):
+
+```go
+if s.endpointing != nil {
+    if chunk.Final {
+        // 整个音频流结束
+        s.asr.Finalize(ctx)
+        return VoiceTurnOutput{Final: true}, nil
+    }
+    if vadOut.VADEnd {
+        // 本地 Silero VAD 检测到断句 → 通知服务端
+        if notifier, ok := s.endpointing.(SegmentEndNotifier); ok {
+            notifier.NotifySegmentEnd(ctx)
+        }
+    }
+    return VoiceTurnOutput{Final: false}, nil
+}
+```
+
+这意味着 `FunASRASR`（实现了 `SegmentEndNotifier`）会在 Silero VAD 断句时收到 `SEGMENT_END`。`AliyunNLSASR` 没有实现这个接口，所以对它无影响。
+
+---
+
+#### 运行时架构 (整体数据流)
+
+```
+麦克风 PCM 16kHz
+  → WebSocket /v1/chat/voice
+  → VoiceSession.ProcessAudio()
+      → Silero VAD (gate: 只在 speech 时输出音频, VADEnd=true 表示一句话说完)
+          → 有音频 → FunASRASR.Write() → WebSocket binary → FunASR 服务
+          → VADEnd  → FunASRASR.NotifySegmentEnd() → "SEGMENT_END" 文本消息
+  → FunASR 服务返回:
+      → partial → partials channel → VoiceTurnOutput{Type:"partial"}
+      → segment_end sentences → sentences channel → 去重 → VoiceTurnOutput{Type:"sentence"}
+          → Pipeline.HandleTextTurn() → LLM → response
+```
+
+---
+
+#### 测试验证
+
+**测试脚本**:
+- `scripts/test_segment_end.go` — 协议级验证：对半切音频 + SEGMENT_END + 继续发送 + STOP
+- `scripts/test_vad_funasr_e2e.go` — 完整链路：Silero VAD 驱动 + FunASR + SEGMENT_END + 延迟测量 + 去重
+
+**运行命令**:
+```bash
+# 协议验证
+go run scripts/test_segment_end.go internal/vad/testdata/test2.wav
+
+# 完整 E2E (Silero VAD + FunASR)
+go run scripts/test_vad_funasr_e2e.go internal/vad/testdata/test2.wav
+```
+
+**E2E 测试结果** (`test2.wav`, 8.6s, 中文 3 句):
+```
+audio: internal/vad/testdata/test2.wav, duration: 8.6s
+  … partial: 一二三四五六七，七六五四三二一。
+[vad] speech end at 4.11s → SEGMENT_END #1
+  ✓ SENTENCE [78ms]: 一二三四五六七，七六五四三二一。
+[vad] speech end at 5.88s → SEGMENT_END #2
+  ✓ SENTENCE [90ms]: 你好，你好。
+[vad] speech end at 7.74s → SEGMENT_END #3
+  ✓ SENTENCE [64ms]: 今天天气怎么样？
+```
+
+**延迟**: SEGMENT_END 发出到 sentence 返回 = **64–90ms** (RTX 5080, gpu-memory-utilization=0.6, Fun-ASR-Nano-2512 via vLLM)
+
+---
+
+#### FunASR 服务启动方式
+
+```bash
+# 方式 1: 用 deploy 脚本 (会自动 apply bind-loopback patch)
+FUNASR_HOME=/data/liuxin/Fun-ASR \
+FUNASR_GPU_MEMORY_UTILIZATION=0.6 \
+FUNASR_VAD_SILENCE_SCHEDULE="inf:200" \
+FUNASR_VAD_SPEECH_NOISE_THRES=0.2 \
+bash deploy/funasr/run-funasr-nano.sh
+
+# 方式 2: 直接运行 (需要先 cd 到 Fun-ASR 并激活 venv)
+cd /data/liuxin/Fun-ASR
+FUNASR_BIND_HOST=127.0.0.1 VLLM_USE_FLASHINFER_SAMPLER=0 \
+.venv/bin/python serve_realtime_ws.py \
+  --port 10095 --language 中文 \
+  --model FunAudioLLM/Fun-ASR-Nano-2512 \
+  --disable-spk --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.6 \
+  --decode-interval 0.8 \
+  --vad-silence-schedule "inf:200" \
+  --vad-speech-noise-thres 0.2
+```
+
+注意事项:
+- 启动约需 40-60 秒（加载 vLLM + VAD + Audio encoder）
+- 停止后 vLLM EngineCore 子进程可能残留（`ps aux | grep EngineCore`），需手动 `kill -9`
+- GPU 显存占用 ~9.8GB (0.6 * 16GB)
+- 服务日志输出到 stderr
+
+---
+
+#### 已知限制和后续工作
+
+1. **FSMN-VAD 形同虚设**: 在 SEGMENT_END 模式下，服务端的 FSMN-VAD 完全不参与断句决策。它的唯一作用是在非 SEGMENT_END 的 periodic decode 中确定 partial 的起始位置。如果将来想完全去掉它可以考虑。
+
+2. **sentences 累积返回**: 每次 `segment_end` / periodic decode 响应都包含所有历史 sentences。对于超长会话，这个列表会越来越大。可以考虑只返回新增的，或者客户端用 index 追踪。
+
+3. **Silero VAD 参数对中文的适配**: 当前用默认 `MinSilenceDurationMs=300`。中文口语中停顿可能更短，可能需要调低到 200ms 做更激进的断句。
+
+4. **未验证真实麦克风流**: 测试都是基于 WAV 文件模拟。真实麦克风有 jitter、丢包、噪声等问题，需要在 `/v1/chat/voice` WebSocket 端做集成测试。
 
 Still needed:
 

@@ -50,6 +50,7 @@ type AliyunNLSASR struct {
 	latest   Transcript
 
 	sentences chan Transcript
+	partials  chan Transcript
 	completed chan error
 }
 
@@ -80,6 +81,7 @@ func NewAliyunNLSASR(ctx context.Context, cfg AliyunNLSASRConfig) (*AliyunNLSASR
 		conn:      conn,
 		taskID:    newAliyunNLSID(),
 		sentences: make(chan Transcript, 32),
+		partials:  make(chan Transcript, 16),
 		completed: make(chan error, 1),
 	}
 	if err := stream.sendStart(ctx); err != nil {
@@ -177,6 +179,13 @@ func (s *AliyunNLSASR) SentenceTranscripts() <-chan Transcript {
 		return nil
 	}
 	return s.sentences
+}
+
+func (s *AliyunNLSASR) PartialTranscripts() <-chan Transcript {
+	if s == nil {
+		return nil
+	}
+	return s.partials
 }
 
 // Finalize stops the complete ASR task. It does not create an utterance boundary.
@@ -294,6 +303,7 @@ func (s *AliyunNLSASR) waitStarted(ctx context.Context) error {
 
 func (s *AliyunNLSASR) readLoop() {
 	defer close(s.sentences)
+	defer close(s.partials)
 	for {
 		messageType, data, err := s.conn.ReadMessage()
 		if err != nil {
@@ -317,7 +327,14 @@ func (s *AliyunNLSASR) readLoop() {
 		}
 		switch message.Header.Name {
 		case "TranscriptionResultChanged":
-			s.updateLatest(Transcript{Text: message.Payload.Result, Confidence: message.Payload.Confidence})
+			partial := Transcript{Text: message.Payload.Result, Confidence: message.Payload.Confidence, IsPartial: true}
+			s.updateLatest(partial)
+			if strings.TrimSpace(partial.Text) != "" {
+				select {
+				case s.partials <- partial:
+				default:
+				}
+			}
 		case "SentenceEnd":
 			transcript := Transcript{Text: message.Payload.Result, Confidence: message.Payload.Confidence, IsFinal: true}
 			s.updateLatest(transcript)
