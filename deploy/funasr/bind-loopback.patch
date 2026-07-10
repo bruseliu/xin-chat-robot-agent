@@ -1,0 +1,19 @@
+diff --git a/serve_realtime_ws.py b/serve_realtime_ws.py
+index 0000000..0000000 100644
+--- a/serve_realtime_ws.py
++++ b/serve_realtime_ws.py
+@@ -508,11 +508,12 @@ def build_websocket_serve_kwargs(args):
+ 
+ async def main(args):
+     load_models(args)
++    bind_host = os.environ.get("FUNASR_BIND_HOST", "127.0.0.1")
+     serve_kwargs = build_websocket_serve_kwargs(args)
+-    logger.info(f"Server on ws://0.0.0.0:{args.port}")
++    logger.info(f"Server on ws://{bind_host}:{args.port}")
+     logger.info(f"WebSocket options: {serve_kwargs}")
+     async with websockets.serve(
+-        lambda ws: handle_client(ws, args), "0.0.0.0", args.port,
++        lambda ws: handle_client(ws, args), bind_host, args.port,
+         **serve_kwargs,
+     ):
+         await asyncio.Future()

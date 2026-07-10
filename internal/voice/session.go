@@ -21,14 +21,20 @@ type Transcript struct {
 	Confidence float64
 }
 
-// StreamingASR is a segment-scoped ASR stream. Audio is written as VAD-gated
-// chunks for one VAD speech segment. Finalize is called when VAD emits VADEnd
-// or when the client closes the audio stream with pending speech.
+// StreamingASR is a connection-scoped ASR stream. Legacy providers can use VAD
+// segments, while server-endpointing providers keep one stream for the full input.
+// Finalize ends the provider task when the client finishes its audio stream.
 type StreamingASR interface {
 	Write(ctx context.Context, chunk vad.Chunk) error
 	Finalize(ctx context.Context) (Transcript, error)
 	Reset() error
 	Close() error
+}
+
+// ServerEndpointingASR emits a final transcript for each provider-detected sentence.
+type ServerEndpointingASR interface {
+	StreamingASR
+	SentenceTranscripts() <-chan Transcript
 }
 
 type ASRFactory func(ctx context.Context) (StreamingASR, error)
@@ -43,22 +49,26 @@ type VoiceTurnOutput struct {
 	Transcript Transcript     `json:"transcript"`
 	Response   TextTurnOutput `json:"response,omitempty"`
 	Final      bool           `json:"final"`
+	Error      string         `json:"error,omitempty"`
 }
 
-// VoiceSession is the per-client-connection runtime. It owns VAD state for the
-// connection and a segment-scoped ASR stream. Every VAD end finalizes one ASR
-// segment and starts one ADK text turn from the final transcript.
+// VoiceSession is the per-client-connection runtime. Legacy ASR providers finalize
+// a VAD segment, while server-endpointing providers emit text turns from their
+// own sentence-final events and stay connected until client stream shutdown.
 type VoiceSession struct {
-	pipeline   *Pipeline
-	vad        vad.AudioProcessor
-	asr        StreamingASR
-	asrFactory ASRFactory
-	cfg        VoiceSessionConfig
-	asrWrote   bool
+	pipeline    *Pipeline
+	vad         vad.AudioProcessor
+	asr         StreamingASR
+	asrFactory  ASRFactory
+	cfg         VoiceSessionConfig
+	asrWrote    bool
+	endpointing ServerEndpointingASR
+	outputs     chan VoiceTurnOutput
+	ctx         context.Context
 }
 
 func NewVoiceSession(pipeline *Pipeline, processor vad.AudioProcessor, asr StreamingASR, cfg VoiceSessionConfig) (*VoiceSession, error) {
-	return newVoiceSession(pipeline, processor, asr, nil, cfg)
+	return newVoiceSession(context.Background(), pipeline, processor, asr, nil, cfg)
 }
 
 func NewVoiceSessionWithASRFactory(ctx context.Context, pipeline *Pipeline, processor vad.AudioProcessor, factory ASRFactory, cfg VoiceSessionConfig) (*VoiceSession, error) {
@@ -69,10 +79,10 @@ func NewVoiceSessionWithASRFactory(ctx context.Context, pipeline *Pipeline, proc
 	if err != nil {
 		return nil, err
 	}
-	return newVoiceSession(pipeline, processor, asr, factory, cfg)
+	return newVoiceSession(ctx, pipeline, processor, asr, factory, cfg)
 }
 
-func newVoiceSession(pipeline *Pipeline, processor vad.AudioProcessor, asr StreamingASR, factory ASRFactory, cfg VoiceSessionConfig) (*VoiceSession, error) {
+func newVoiceSession(ctx context.Context, pipeline *Pipeline, processor vad.AudioProcessor, asr StreamingASR, factory ASRFactory, cfg VoiceSessionConfig) (*VoiceSession, error) {
 	if pipeline == nil {
 		return nil, fmt.Errorf("voice session requires pipeline")
 	}
@@ -85,13 +95,61 @@ func newVoiceSession(pipeline *Pipeline, processor vad.AudioProcessor, asr Strea
 	if strings.TrimSpace(cfg.UserID) == "" {
 		return nil, fmt.Errorf("voice session requires user id")
 	}
-	return &VoiceSession{
+	session := &VoiceSession{
 		pipeline:   pipeline,
 		vad:        processor,
 		asr:        asr,
 		asrFactory: factory,
 		cfg:        cfg,
-	}, nil
+		ctx:        ctx,
+	}
+	if session.ctx == nil {
+		session.ctx = context.Background()
+	}
+	if endpointing, ok := asr.(ServerEndpointingASR); ok {
+		session.endpointing = endpointing
+		session.outputs = make(chan VoiceTurnOutput, 16)
+		go session.consumeServerEndpointingTranscripts()
+	}
+	return session, nil
+}
+
+// Outputs returns provider-driven sentence results for server-endpointing ASR.
+func (s *VoiceSession) Outputs() <-chan VoiceTurnOutput {
+	if s == nil {
+		return nil
+	}
+	return s.outputs
+}
+
+func (s *VoiceSession) consumeServerEndpointingTranscripts() {
+	defer close(s.outputs)
+	for transcript := range s.endpointing.SentenceTranscripts() {
+		if !transcript.IsFinal || strings.TrimSpace(transcript.Text) == "" {
+			continue
+		}
+		output, err := s.runTextTurn(s.ctx, transcript)
+		if err != nil {
+			output = VoiceTurnOutput{Transcript: transcript, Final: true, Error: err.Error()}
+		}
+		s.outputs <- output
+	}
+}
+
+func (s *VoiceSession) runTextTurn(ctx context.Context, transcript Transcript) (VoiceTurnOutput, error) {
+	transcript.IsFinal = true
+	metadata := cloneMetadata(s.cfg.Metadata)
+	metadata["source"] = "voice_session"
+	response, err := s.pipeline.HandleTextTurn(ctx, TextTurnInput{
+		UserID:    s.cfg.UserID,
+		SessionID: s.cfg.SessionID,
+		Text:      strings.TrimSpace(transcript.Text),
+		Metadata:  metadata,
+	})
+	if err != nil {
+		return VoiceTurnOutput{}, err
+	}
+	return VoiceTurnOutput{Transcript: transcript, Response: response, Final: true}, nil
 }
 
 func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (VoiceTurnOutput, error) {
@@ -112,6 +170,15 @@ func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (Voic
 			return VoiceTurnOutput{}, err
 		}
 		s.asrWrote = true
+	}
+	if s.endpointing != nil {
+		if chunk.Final {
+			if _, err := s.asr.Finalize(ctx); err != nil {
+				return VoiceTurnOutput{}, err
+			}
+			return VoiceTurnOutput{Final: true}, nil
+		}
+		return VoiceTurnOutput{Final: false}, nil
 	}
 	if vadOut.VADEnd {
 		return s.finalizeASRTurn(ctx, chunk.Final)

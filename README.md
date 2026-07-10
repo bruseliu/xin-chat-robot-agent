@@ -38,7 +38,7 @@ client audio stream
       -> client audio
 ```
 
-`internal/voice.VoiceSession` owns the VAD processor and ASR stream for one client connection. It writes only VAD-gated speech audio to ASR. `VADEnd` marks the end of one VAD speech segment, but it does not finalize ASR; multiple VAD segments can be written into the same ASR connection. The session finalizes ASR only when the client sends the whole-stream final control message, then starts one ADK text turn with the final transcript.
+`internal/voice.VoiceSession` owns one VAD processor and ASR stream per client connection. Legacy providers keep the local VAD-gated segment path. With `ASR_PROVIDER=funasr` and `VAD_PROVIDER=passthrough`, the full PCM stream, including silence, goes to the private Fun-ASR-Nano WebSocket service. Each locked provider sentence starts one ADK text turn without closing the ASR connection; the client `final` control message sends `STOP` and waits for the final response.
 
 `GET /v1/chat/voice` is the current WebSocket entry point. It expects `user_id` and optional `session_id`/`sample_rate` query parameters. Binary messages are treated as PCM16LE audio chunks; a text control message `{"type":"final"}` flushes the current audio stream. When ASR returns a final transcript, the server responds with a JSON `VoiceTurnOutput`.
 
@@ -58,7 +58,7 @@ START -> turn_context -> memory_context -> llm -> memory_commit
 
 Node payloads use text-first envelopes (`TurnContext`, `LLMInput`, `LLMOutput`) with optional `AttachmentRef` values. Image memory is not implemented now, but future image/audio/video blobs can be attached by reference without changing the reasoning graph shape.
 
-The current ASR provider implementation is `internal/voice.DoubaoASR`, a connection-scoped `StreamingASR` adapter for the Doubao/Volcengine WebSocket ASR protocol. It sends VAD-gated PCM audio chunks, exposes partial/final ASR text through `Transcripts()`, and finalizes the ASR stream only at the end of the whole input stream.
+The selected ASR implementation is `internal/voice.FunASRASR`, a connection-scoped adapter for the private Fun-ASR-Nano real-time WebSocket service. It sends `START`, continuous PCM binary frames, maps locked `sentences[]` items to final user utterances, and sends `STOP` only when the client finishes the entire microphone stream. `AliyunNLSASR` and `DoubaoASR` remain available as cloud fallbacks.
 
 The next concrete replacements are:
 
@@ -80,10 +80,10 @@ go test ./internal/vad
 
 The repository carries ONNX Runtime v1.18.1 under `third_party/onnxruntime/linux-x64-1.18.1`, and the local `silero-vad-go` cgo directives point at that directory. It also needs the Silero VAD v5 ONNX model path at runtime.
 
-Runtime configuration:
+Runtime configuration for the selected FunASR path:
 
 ```env
-VAD_PROVIDER=silero
+VAD_PROVIDER=passthrough
 SILERO_VAD_MODEL_PATH=models/silero-vad/silero_vad.onnx
 VAD_SAMPLE_RATE=16000
 VAD_THRESHOLD=0.5
@@ -95,21 +95,18 @@ VAD_AUDIO_BUFFER_SECONDS=5
 VAD_MAX_SPEECH_MS=15000
 ```
 
+Set `VAD_PROVIDER=silero` only for the legacy local-VAD ASR path.
+
 ASR configuration:
 
 ```env
-ASR_PROVIDER=doubao
-DOUBAO_ASR_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel
-DOUBAO_ASR_APP_KEY=<app key>
-DOUBAO_ASR_ACCESS_KEY=<access key>
-DOUBAO_ASR_RESOURCE_ID=volc.bigasr.sauc.duration
-DOUBAO_ASR_MODEL_NAME=bigmodel
-DOUBAO_ASR_LANGUAGE=zh-CN
-DOUBAO_ASR_SAMPLE_RATE=16000
-DOUBAO_ASR_ENABLE_PUNC=true
-DOUBAO_ASR_COMPRESS_AUDIO=true
-DOUBAO_ASR_TIMEOUT_SECONDS=30
+ASR_PROVIDER=funasr
+FUNASR_URL=ws://127.0.0.1:10095
+FUNASR_SAMPLE_RATE=16000
+FUNASR_TIMEOUT_SECONDS=30
 ```
+
+Start the private service with [deploy/funasr/README.md](deploy/funasr/README.md).
 
 With `VAD_PROVIDER=none`, no detector is created; audio sessions must provide a VAD processor before they can process microphone input.
 
@@ -214,7 +211,7 @@ curl -X POST http://localhost:8080/v1/chat/text \
 
 ## Next Work
 
-1. Replace `echoPlanner` with a real ADK 2.0 Go runner using the configured PostgreSQL SessionService and mem0 MemoryService.
-2. Validate `/v1/chat/voice` against a real microphone WebSocket client.
+1. Validate `/v1/chat/voice` end to end with the configured Postgres and LLM services, using a real microphone WebSocket client.
+2. Add a local ASR health check and restart policy.
 3. Implement the streaming TTS adapter outside the ADK graph.
 4. Add barge-in / interruption control.

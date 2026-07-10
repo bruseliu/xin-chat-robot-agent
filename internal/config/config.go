@@ -42,17 +42,30 @@ type LLMConfig struct {
 }
 
 type ASRConfig struct {
-	Provider            string
-	DoubaoURL           string
-	DoubaoAppKey        string
-	DoubaoAccessKey     string
-	DoubaoResourceID    string
-	DoubaoModelName     string
-	DoubaoLanguage      string
-	DoubaoSampleRate    int
-	DoubaoEnablePunc    bool
-	DoubaoCompressAudio bool
-	DoubaoTimeout       time.Duration
+	Provider                           string
+	FunASRURL                          string
+	FunASRSampleRate                   int
+	FunASRTimeout                      time.Duration
+	AliyunNLSURL                       string
+	AliyunNLSToken                     string
+	AliyunNLSAppKey                    string
+	AliyunNLSSampleRate                int
+	AliyunNLSPunctuation               bool
+	AliyunNLSITN                       bool
+	AliyunNLSIntermediate              bool
+	AliyunNLSSemanticSentenceDetection bool
+	AliyunNLSMaxSentenceSilenceMs      int
+	AliyunNLSTimeout                   time.Duration
+	DoubaoURL                          string
+	DoubaoAppKey                       string
+	DoubaoAccessKey                    string
+	DoubaoResourceID                   string
+	DoubaoModelName                    string
+	DoubaoLanguage                     string
+	DoubaoSampleRate                   int
+	DoubaoEnablePunc                   bool
+	DoubaoCompressAudio                bool
+	DoubaoTimeout                      time.Duration
 }
 
 type VADConfig struct {
@@ -107,17 +120,30 @@ func Load() Config {
 			MaxSpeechMs:          envInt("VAD_MAX_SPEECH_MS", 15000),
 		},
 		ASR: ASRConfig{
-			Provider:            envString("ASR_PROVIDER", "none"),
-			DoubaoURL:           envString("DOUBAO_ASR_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"),
-			DoubaoAppKey:        envString("DOUBAO_ASR_APP_KEY", ""),
-			DoubaoAccessKey:     envString("DOUBAO_ASR_ACCESS_KEY", ""),
-			DoubaoResourceID:    envString("DOUBAO_ASR_RESOURCE_ID", "volc.bigasr.sauc.duration"),
-			DoubaoModelName:     envString("DOUBAO_ASR_MODEL_NAME", "bigmodel"),
-			DoubaoLanguage:      envString("DOUBAO_ASR_LANGUAGE", "zh-CN"),
-			DoubaoSampleRate:    envInt("DOUBAO_ASR_SAMPLE_RATE", 16000),
-			DoubaoEnablePunc:    envBool("DOUBAO_ASR_ENABLE_PUNC", true),
-			DoubaoCompressAudio: envBool("DOUBAO_ASR_COMPRESS_AUDIO", true),
-			DoubaoTimeout:       time.Duration(envInt("DOUBAO_ASR_TIMEOUT_SECONDS", 30)) * time.Second,
+			Provider:                           envString("ASR_PROVIDER", "none"),
+			FunASRURL:                          envString("FUNASR_URL", "ws://127.0.0.1:10095"),
+			FunASRSampleRate:                   envInt("FUNASR_SAMPLE_RATE", 16000),
+			FunASRTimeout:                      time.Duration(envInt("FUNASR_TIMEOUT_SECONDS", 30)) * time.Second,
+			AliyunNLSURL:                       envString("ALIYUN_NLS_URL", "wss://nls-gateway.cn-shanghai.aliyuncs.com/ws/v1"),
+			AliyunNLSToken:                     envString("ALIYUN_NLS_TOKEN", ""),
+			AliyunNLSAppKey:                    envString("ALIYUN_NLS_APP_KEY", ""),
+			AliyunNLSSampleRate:                envInt("ALIYUN_NLS_SAMPLE_RATE", 16000),
+			AliyunNLSPunctuation:               envBool("ALIYUN_NLS_ENABLE_PUNCTUATION", true),
+			AliyunNLSITN:                       envBool("ALIYUN_NLS_ENABLE_ITN", true),
+			AliyunNLSIntermediate:              envBool("ALIYUN_NLS_ENABLE_INTERMEDIATE", true),
+			AliyunNLSSemanticSentenceDetection: envBool("ALIYUN_NLS_ENABLE_SEMANTIC_SENTENCE_DETECTION", true),
+			AliyunNLSMaxSentenceSilenceMs:      envInt("ALIYUN_NLS_MAX_SENTENCE_SILENCE_MS", 800),
+			AliyunNLSTimeout:                   time.Duration(envInt("ALIYUN_NLS_TIMEOUT_SECONDS", 30)) * time.Second,
+			DoubaoURL:                          envString("DOUBAO_ASR_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"),
+			DoubaoAppKey:                       envString("DOUBAO_ASR_APP_KEY", ""),
+			DoubaoAccessKey:                    envString("DOUBAO_ASR_ACCESS_KEY", ""),
+			DoubaoResourceID:                   envString("DOUBAO_ASR_RESOURCE_ID", "volc.bigasr.sauc.duration"),
+			DoubaoModelName:                    envString("DOUBAO_ASR_MODEL_NAME", "bigmodel"),
+			DoubaoLanguage:                     envString("DOUBAO_ASR_LANGUAGE", "zh-CN"),
+			DoubaoSampleRate:                   envInt("DOUBAO_ASR_SAMPLE_RATE", 16000),
+			DoubaoEnablePunc:                   envBool("DOUBAO_ASR_ENABLE_PUNC", true),
+			DoubaoCompressAudio:                envBool("DOUBAO_ASR_COMPRESS_AUDIO", true),
+			DoubaoTimeout:                      time.Duration(envInt("DOUBAO_ASR_TIMEOUT_SECONDS", 30)) * time.Second,
 		},
 	}
 }

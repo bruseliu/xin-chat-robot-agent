@@ -130,8 +130,11 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	closeSession := func() {}
+
 	processor, err := s.vadFactory()
 	if err != nil {
+		closeSession()
 		writeWSError(conn, "vad_create_failed", err)
 		return
 	}
@@ -146,10 +149,31 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 		if processor != nil {
 			_ = processor.Close()
 		}
+		closeSession()
 		writeWSError(conn, "voice_session_create_failed", err)
 		return
 	}
-	defer session.Close()
+	outputs := session.Outputs()
+	var writerDone chan struct{}
+	if outputs != nil {
+		writerDone = make(chan struct{})
+		go func() {
+			defer close(writerDone)
+			for output := range outputs {
+				if err := conn.WriteJSON(output); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	closeSession = func() {
+		_ = session.Close()
+		if writerDone != nil {
+			<-writerDone
+			writerDone = nil
+		}
+	}
+	defer closeSession()
 
 	for {
 		messageType, payload, err := conn.ReadMessage()
@@ -160,10 +184,11 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 		case websocket.BinaryMessage:
 			out, err := session.ProcessAudio(r.Context(), voice.AudioChunk{PCM16LE: payload, SampleRate: sampleRate})
 			if err != nil {
+				closeSession()
 				writeWSError(conn, "voice_process_failed", err)
 				return
 			}
-			if out.Final {
+			if outputs == nil && out.Final {
 				if err := conn.WriteJSON(out); err != nil {
 					return
 				}
@@ -171,19 +196,22 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 		case websocket.TextMessage:
 			var msg voiceControlMessage
 			if err := json.Unmarshal(payload, &msg); err != nil {
+				closeSession()
 				writeWSError(conn, "invalid_control_message", err)
 				return
 			}
 			if msg.Type != "final" {
+				closeSession()
 				writeWSError(conn, "unsupported_control_message", fmt.Errorf("unsupported control type %q", msg.Type))
 				return
 			}
 			out, err := session.ProcessAudio(r.Context(), voice.AudioChunk{SampleRate: sampleRate, Final: true})
 			if err != nil {
+				closeSession()
 				writeWSError(conn, "voice_finalize_failed", err)
 				return
 			}
-			if out.Final {
+			if outputs == nil && out.Final {
 				if err := conn.WriteJSON(out); err != nil {
 					return
 				}

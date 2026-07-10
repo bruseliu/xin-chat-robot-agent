@@ -13,6 +13,8 @@ func newVADDetector(cfg config.VADConfig) (vad.AudioProcessor, error) {
 	switch cfg.Provider {
 	case "", "none":
 		return nil, nil
+	case "passthrough":
+		return vad.NewPassthrough(), nil
 	case "silero":
 		return vad.NewSileroStreamingDetector(vad.SileroConfig{
 			ModelPath:            cfg.SileroModelPath,
