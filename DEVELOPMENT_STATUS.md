@@ -562,3 +562,353 @@ Replace the placeholder local `ADKRunner` with a real ADK runner path:
 4. Attach `NewADKService(mem0Client, agentID, topK)` as `runner.Config.MemoryService`.
 5. Convert `/v1/chat/text` to call `runner.Run(...)`.
 6. Extract final assistant text from emitted ADK `session.Event` values.
+
+---
+
+## Development Log: Doubao Streaming LLM + Bidirectional TTS (2026-07-12)
+
+This section supersedes the older statements above that streaming TTS and the provider-backed LLM path were not implemented. The realtime output path is now implemented and validated against the real Doubao services.
+
+### Scope Completed Today
+
+The following path is now implemented:
+
+```text
+FunASR final sentence
+  -> VoiceSession.runTextTurn
+  -> ADK runner / Doubao LLM SSE stream
+  -> LLM delta events
+  -> TTS text chunker
+  -> Doubao bidirectional TTS WebSocket
+  -> asynchronous PCM chunks
+  -> /v1/chat/voice binary WebSocket frames
+  -> client/player
+```
+
+The LLM and TTS streams remain active at the same time. LLM output is not collected into a complete answer before synthesis starts. Text deltas are accumulated only into short TTS-friendly phrase chunks, then written while a separate goroutine continuously consumes returned PCM audio.
+
+### Doubao Bidirectional Streaming TTS Adapter
+
+New implementation:
+
+- `internal/tts/types.go`
+- `internal/tts/doubao.go`
+- `internal/tts/doubao_test.go`
+- `internal/tts/doubao_real_test.go`
+- `cmd/server/tts_doubao.go`
+
+The provider adapter implements this connection-scoped interface:
+
+```go
+type Stream interface {
+    WriteText(ctx context.Context, text string) error
+    Finish(ctx context.Context) error
+    Cancel(ctx context.Context) error
+    Audio() <-chan AudioChunk
+    Errors() <-chan error
+    SampleRate() int
+    Close() error
+}
+```
+
+Implemented Doubao protocol behavior:
+
+- Endpoint: `wss://openspeech.bytedance.com/api/v3/tts/bidirection`
+- Authentication headers:
+  - `X-Api-App-Key`
+  - `X-Api-Access-Key`
+  - `X-Api-Resource-Id`
+  - `X-Api-Connect-Id`
+- Session events:
+  - `StartSession` (`100`)
+  - `TaskRequest` (`200`)
+  - `FinishSession` (`102`)
+  - `CancelSession` (`101`)
+  - `SessionStarted` (`150`)
+  - `SessionFinished` (`152`)
+  - `SessionFailed` (`153`)
+  - `TTSResponse` (`352`)
+- PCM output format: mono, signed 16-bit little-endian PCM at the configured sample rate.
+- One reader goroutine parses server frames and publishes `AudioChunk` values while caller goroutines continue sending text.
+- WebSocket writes are serialized by a mutex.
+- Session start waits for `SessionStarted` and fails on provider error, context cancellation, or timeout.
+- `Finish` drains provider audio through the final event; `Cancel` supports interrupted turns.
+
+Runtime configuration added:
+
+```bash
+TTS_PROVIDER=doubao
+DOUBAO_TTS_URL=wss://openspeech.bytedance.com/api/v3/tts/bidirection
+DOUBAO_TTS_APP_ID=
+DOUBAO_TTS_ACCESS_TOKEN=
+DOUBAO_TTS_RESOURCE_ID=seed-tts-2.0
+DOUBAO_TTS_SPEAKER=saturn_zh_female_cancan_tob
+DOUBAO_TTS_SAMPLE_RATE=16000
+```
+
+Credentials belong in `.env`, not `.env.example`. `.gitignore` now ignores `.env` and `.env.*` while retaining `.env.example`. Because `.env` was already tracked before this correction, it must be removed from the Git index before a future commit:
+
+```bash
+git rm --cached .env
+```
+
+Any access token previously committed or displayed outside the local environment should be rotated.
+
+### VoiceSession LLM-to-TTS Integration
+
+Modified:
+
+- `internal/voice/session.go`
+- `internal/voice/session_tts_test.go`
+
+`VoiceSession` now:
+
+1. Receives `agent.StreamEventLLMDelta` events from `Pipeline.HandleTextTurnStream`.
+2. Emits `VoiceTurnOutput{Type: "llm_delta"}` for transport/UI consumers.
+3. Starts TTS lazily when the first usable LLM text arrives. This prevents a slow LLM first-token response from consuming the TTS WebSocket idle timeout before any text is sent.
+4. Starts a separate audio-forwarding goroutine immediately after the TTS session starts.
+5. Writes aggregated text chunks to the live TTS session while PCM is read concurrently.
+6. Calls `Finish` only after the LLM stream and final pending text chunk are complete.
+7. Waits for the TTS final event before emitting the final sentence output.
+8. Cancels and closes the active TTS stream when the voice session closes or the turn context is cancelled.
+9. Falls back to synthesizing the final LLM text when a provider returns no partial delta events.
+
+Voice output event order is now conceptually:
+
+```text
+tts_start JSON
+llm_delta JSON (repeated)
+tts_audio binary frame (repeated and interleaved with deltas)
+tts_end JSON
+sentence JSON
+```
+
+Audio data is not JSON/base64 encoded. `internal/api/server.go` has one WebSocket writer goroutine; outputs with `AudioPCM` are sent as WebSocket binary messages and control/text outputs are sent as JSON. This preserves Gorilla WebSocket's single-writer requirement.
+
+### LLM Delta Aggregation and TTS Backpressure
+
+New implementation:
+
+- `internal/tts/text_chunker.go`
+- `internal/tts/text_chunker_test.go`
+
+A real test initially exposed this failure mode:
+
+```text
+711 LLM deltas
+  -> 711 TaskRequest writes to TTS
+  -> TTS synthesis queue remains active after LLM completion
+  -> 90 second test context expires
+```
+
+Doubao often emits character-sized deltas. Sending every character as a separate TTS task is protocol-valid but creates excessive request overhead and synthesis backlog. The production path now uses `TextChunker`:
+
+- Flush at Chinese/English punctuation or newline.
+- Flush when buffered text reaches 24 Unicode runes.
+- Flush remaining text when the LLM stream ends.
+- Continue emitting every original `llm_delta` event to clients; only the TTS request granularity changes.
+
+Validated reduction in one real run:
+
+```text
+255 LLM deltas
+  -> 37 aggregated TTS text chunks
+  -> 2,605,280 PCM bytes
+  -> completed in 57.927 seconds
+  -> PASS
+```
+
+This is phrase-level streaming, not whole-answer buffering. TTS can begin before the LLM finishes, while avoiding hundreds of character-level protocol requests.
+
+### Doubao LLM Streaming Updates
+
+Modified:
+
+- `internal/llm/doubao.go`
+- `internal/tts/llm_tts_real_test.go`
+
+The Doubao OpenAI-compatible request now maps ADK/genai `GenerateContentConfig.MaxOutputTokens` to the provider `max_tokens` field.
+
+A fixed `max_tokens=256` test configuration was removed after it truncated a valid response in the middle of a sentence (`"圆明园...曾被誉为‘万"`). The real integration test now uses:
+
+- Default `DOUBAO_LLM_TTS_MAX_TOKENS=512`.
+- Default total test timeout `DOUBAO_LLM_TTS_TIMEOUT_SECONDS=180`.
+- A system instruction requesting natural speech-ready Chinese, no Markdown, at most roughly 300 Chinese characters, and a complete ending.
+
+These values are test controls. Production response length should primarily be controlled by the agent instruction and product policy, with `max_tokens` retained as a high safety ceiling rather than the normal method for producing concise speech.
+
+### Real LLM + TTS Integration Test
+
+Test file:
+
+- `internal/tts/llm_tts_real_test.go`
+
+The test performs a real full-duplex provider integration:
+
+1. Starts a streaming Doubao LLM request.
+2. Logs every partial LLM delta with sequence number and elapsed time.
+3. Lazily starts the Doubao TTS session on the first completed text phrase.
+4. Sends aggregated phrase chunks while LLM deltas continue arriving.
+5. Reads PCM concurrently from `Audio()`.
+6. Logs first LLM delta latency, first PCM latency, LLM delta count, TTS text chunk count, answer, PCM byte count, and total duration.
+
+Custom prompt command:
+
+```bash
+set -a
+source .env
+set +a
+
+DOUBAO_LLM_TTS_PROMPT="请介绍一下北京的著名景点" \
+DOUBAO_LLM_TTS_MAX_TOKENS=512 \
+DOUBAO_LLM_TTS_TIMEOUT_SECONDS=180 \
+DOUBAO_LLM_TTS_REAL_TEST=1 \
+go test ./internal/tts \
+  -run TestDoubaoLLMToTTSRealStream -count=1 -v
+```
+
+Without playback mode, the test writes:
+
+```text
+tmp/doubao_llm_tts_stream.wav
+```
+
+The path is explicitly resolved from the Go package test working directory (`internal/tts`) back to the repository root. This fixes the earlier accidental output under `internal/tts/tmp`.
+
+### Direct Streaming Playback
+
+The real integration test supports direct playback without writing a WAV file:
+
+```bash
+set -a
+source .env
+set +a
+
+DOUBAO_LLM_TTS_PLAY=1 \
+DOUBAO_LLM_TTS_PROMPT="请介绍一下北京的著名景点" \
+DOUBAO_LLM_TTS_REAL_TEST=1 \
+go test ./internal/tts \
+  -run TestDoubaoLLMToTTSRealStream -count=1 -v
+```
+
+Playback behavior:
+
+```text
+Doubao PCM chunk
+  -> aplay stdin
+  -> ALSA playback device
+```
+
+The command used by the test is equivalent to:
+
+```bash
+aplay -q -t raw -f S16_LE -r "$DOUBAO_TTS_SAMPLE_RATE" -c 1
+```
+
+When `DOUBAO_LLM_TTS_PLAY=1`, audio is streamed to the player and WAV output is skipped. When the variable is absent, the test keeps the deterministic WAV output behavior.
+
+Installed local playback tools detected during development:
+
+- `/usr/bin/aplay`
+- `/usr/bin/pw-play`
+- `/usr/bin/ffplay`
+
+The current test uses `aplay`.
+
+### Standalone Real TTS Test
+
+`internal/tts/doubao_real_test.go` validates bidirectional TTS independently from the LLM. It starts the audio consumer before sending multiple text fragments, calls `Finish`, validates non-empty PCM, and writes a valid WAV file.
+
+Run:
+
+```bash
+set -a
+source .env
+set +a
+DOUBAO_TTS_REAL_TEST=1 \
+go test ./internal/tts -run TestDoubaoStreamRealService -count=1 -v
+```
+
+Output:
+
+```text
+tmp/doubao_tts_real_test.wav
+```
+
+Validated example:
+
+```text
+received 105862 PCM bytes
+RIFF/WAVE, Microsoft PCM, 16 bit, mono, 16000 Hz
+```
+
+### Tests Added or Updated
+
+Coverage added today:
+
+- Mock Doubao WebSocket validates authentication headers, session/task/finish events, payload fields, PCM frames, final event, and provider error frames.
+- Real Doubao bidirectional TTS test.
+- Real Doubao LLM-to-TTS streaming test.
+- `TextChunker` Unicode/punctuation/maximum-length behavior.
+- `VoiceSession` LLM delta -> TTS text -> PCM -> final event ordering.
+- Voice WebSocket integration verifies PCM is sent as a binary frame.
+- Voice session cancellation closes an active TTS stream.
+- Fallback synthesis supports non-streaming/final-only LLM providers.
+
+Relevant package verification:
+
+```bash
+go test ./internal/tts ./internal/llm ./internal/voice ./internal/api ./cmd/server -count=1
+```
+
+These packages pass. `git diff --check` also passes.
+
+The repository-wide command currently has a pre-existing structural failure unrelated to TTS:
+
+```bash
+go test ./...
+```
+
+The `scripts` directory contains multiple standalone `package main` programs in one directory (`test_funasr_realtime.go`, `test_segment_end.go`, and `test_vad_funasr_e2e.go`), so Go reports duplicate `main` declarations when treating that directory as one package. Each script remains runnable individually with `go run <file>`.
+
+### FunASR Environment and Segment-End Status
+
+The current workstation uses:
+
+```text
+/home/liuxin/fun-asr
+```
+
+The private Fun-ASR-Nano service was prepared in this environment and tested at:
+
+```text
+ws://127.0.0.1:10095
+```
+
+The deployed source includes the `SEGMENT_END` behavior documented earlier: local Silero VAD can force sentence decoding without closing the FunASR WebSocket. The Go end-to-end script uses 200 ms audio chunks and reports partial ASR results while audio is still uploading. A representative three-sentence run detected three VAD segment ends and returned three final sentences.
+
+Note that older sections in this document reference `/data/liuxin/Fun-ASR`; that was the previous environment. The active source location for this workstation is `/home/liuxin/fun-asr`.
+
+### Current Known Limitations
+
+1. Real microphone -> FunASR -> LLM -> TTS -> client speaker has not yet been exercised as one continuous `/v1/chat/voice` session. Provider-level and transport-level components are tested separately.
+2. Barge-in is not complete at the product level. `VoiceSession` can cancel an active TTS stream, but new user speech is not yet wired to trigger cancellation and flush already-buffered client audio.
+3. The server sends raw PCM binary frames. Browser clients need an AudioWorklet or equivalent PCM playback buffer; native clients need ALSA/PulseAudio/PipeWire playback integration.
+4. Backpressure policy is currently a fixed 24-rune/punctuation chunker. It should be tuned with real conversational prompts, especially for the tradeoff between first-audio latency and natural prosody.
+5. TTS input cleanup relies on the LLM system instruction to avoid Markdown. A deterministic speech-text sanitizer should still remove Markdown, URLs, code blocks, and unsupported symbols before TTS.
+6. Long answers produce long audio and can delay turn completion. Product-level response length should remain concise for voice interactions.
+7. `.env` was previously tracked by Git. Ignoring it does not automatically remove it from the index or history.
+
+### Next Recommended Step (Updated)
+
+The next implementation milestone is a real microphone end-to-end client for `/v1/chat/voice`:
+
+1. Capture mono 16 kHz PCM in 200 ms frames.
+2. Send frames to `/v1/chat/voice` over one WebSocket.
+3. Display FunASR partial/final transcripts and LLM deltas.
+4. Feed server binary PCM frames directly into a jitter-aware playback queue.
+5. Measure speech-end -> ASR final, ASR final -> first LLM delta, first delta -> first PCM, and speech-end -> audible response.
+6. On new speech/VAD start, cancel the active TTS turn, clear queued playback PCM, and continue the existing microphone session.
+7. Add a deterministic TTS text sanitizer before production tuning.
+
+After this E2E client is stable, implement barge-in/interruption tests and then validate PostgreSQL session storage plus mem0 behavior under multi-turn voice conversations.

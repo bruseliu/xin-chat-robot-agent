@@ -55,12 +55,15 @@ func main() {
 				fmt.Printf("[server] connection closed: %v\n", err)
 				return
 			}
-			var obj any
+			var obj map[string]any
 			if json.Unmarshal(msg, &obj) == nil {
 				fmt.Print("[server] ")
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetEscapeHTML(false)
 				enc.Encode(obj)
+				if obj["event"] == "stopped" {
+					return
+				}
 			} else {
 				fmt.Printf("[server] %s\n", msg)
 			}
@@ -70,6 +73,7 @@ func main() {
 	chunkSize := 6400 // 200ms at 16kHz 16bit mono
 	chunkDuration := 200 * time.Millisecond
 	halfPoint := len(pcm) / 2
+	halfPoint -= halfPoint % 2
 
 	fmt.Printf("\n[client] Sending first half (%d bytes, %.1fs)...\n", halfPoint, float64(halfPoint)/2/16000)
 	for i := 0; i < halfPoint; i += chunkSize {

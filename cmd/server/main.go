@@ -72,6 +72,11 @@ func main() {
 	}
 
 	pipeline := voice.NewPipeline(agentRunner, memClient, logger)
+	ttsFactory, err := newTTSFactory(cfg.TTS)
+	if err != nil {
+		logger.Error("create TTS factory failed", "error", err)
+		os.Exit(1)
+	}
 	server := api.NewServer(api.Config{
 		Addr:       cfg.Addr,
 		SampleRate: cfg.VAD.SampleRate,
@@ -82,6 +87,7 @@ func main() {
 		func(ctx context.Context) (voice.StreamingASR, error) {
 			return newASRStream(ctx, cfg.ASR)
 		},
+		ttsFactory,
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

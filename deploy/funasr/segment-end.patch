@@ -1,17 +1,87 @@
+diff --git a/serve_realtime_ws.py b/serve_realtime_ws.py
+index ed817ab..8cb7596 100644
 --- a/serve_realtime_ws.py
 +++ b/serve_realtime_ws.py
+@@ -241,6 +241,7 @@ class RealtimeASRSession:
+         self.last_partial_text = ""
+         self.last_decode_samples = 0
+         self.locked_sentences = []
++        self._force_speech_on_next_audio = False
+         self.prev_seg_text = ""
+         self.spk_tracker = spk_tracker
+         self.use_context = True
+@@ -251,6 +252,10 @@ class RealtimeASRSession:
+         audio_float = audio_int16.astype(np.float32) / 32768.0
+         self.audio_buffer = np.concatenate([self.audio_buffer, audio_float])
 
- Adds SEGMENT_END WebSocket command to the FunASR streaming server.
++        if self._force_speech_on_next_audio and self.vad.current_speech_start is None:
++            self.vad.current_speech_start = int((len(self.audio_buffer) - len(audio_float)) * 1000 / self.sample_rate)
++            self._force_speech_on_next_audio = False
++
+         new_audio = self.audio_buffer[self.vad_fed_samples:]
+         if len(new_audio) > 0:
+             new_confirmed = self.vad.feed(torch.from_numpy(new_audio).float(), is_final=False)
+@@ -272,6 +277,28 @@ class RealtimeASRSession:
+         threshold = self.first_chunk_samples if not self.first_decode_done else self.chunk_samples
+         return (len(self.audio_buffer) - self.last_decode_samples) >= threshold
 
- When the client's local VAD detects end-of-speech, it sends "SEGMENT_END"
- (text message). The server force-decodes the current audio segment, locks it
- as a sentence, resets VAD state, and continues accepting audio on the same
- connection. This avoids reconnection overhead while using the client's
- superior VAD for sentence boundary detection.
++    @torch.no_grad()
++    def force_segment_end(self):
++        if self.vad.current_speech_start is None:
++            return self._build_response(is_final=False)
++
++        end_ms = int(len(self.audio_buffer) * 1000 / self.sample_rate)
++        seg = [self.vad.current_speech_start, end_ms]
++        seg_text = self._decode_segment(seg)
++        if seg_text.strip():
++            sentence = {"text": seg_text, "start": int(seg[0]), "end": int(seg[1])}
++            self.locked_sentences.append(sentence)
++            if self.spk_tracker:
++                start_sample = int(seg[0] * self.sample_rate / 1000)
++                self.spk_tracker.assign_streaming(self.audio_buffer[start_sample:], seg[0]/1000, seg[1]/1000, sentence)
++
++        self.vad.current_speech_start = None
++        self.prev_text = ""
++        self.last_partial_text = ""
++        self.first_decode_done = False
++        self._force_speech_on_next_audio = True
++        return self._build_response(is_final=False)
++
+     @torch.no_grad()
+     def decode(self, is_final=False):
+         if len(self.audio_buffer) < self.chunk_samples:
+@@ -389,6 +416,7 @@ class RealtimeASRSession:
+         self.last_partial_text = ""
+         self.last_decode_samples = 0
+         self.locked_sentences = []
++        self._force_speech_on_next_audio = False
+         if self.spk_tracker:
+             self.spk_tracker.reset()
 
- Protocol:
-   START → binary audio... → SEGMENT_END → (sentence returned) → binary audio... → STOP
+@@ -479,6 +507,11 @@ async def handle_client(websocket, args):
+                         logger.info(f"Final: {len(result['sentences'])} sentences")
+                         session.is_active = False
+                     await websocket.send(json.dumps({"event": "stopped"}))
++                elif cmd.upper() == "SEGMENT_END":
++                    if session.is_active:
++                        result = await asyncio.to_thread(session.force_segment_end)
++                        result["event"] = "segment_end"
++                        await websocket.send(json.dumps(result))
+             elif isinstance(message, bytes) and session.is_active:
+                 await asyncio.to_thread(session.add_audio, message)
+                 now = time.time()
+@@ -508,11 +541,12 @@ def build_websocket_serve_kwargs(args):
 
- Changes:
- 1. RealtimeASRSession.force_segment_end() method
- 2. handle_client: SEGMENT_END command handler (responds with event="segment_end")
+ async def main(args):
+     load_models(args)
++    bind_host = os.environ.get("FUNASR_BIND_HOST", "127.0.0.1")
+     serve_kwargs = build_websocket_serve_kwargs(args)
+-    logger.info(f"Server on ws://0.0.0.0:{args.port}")
++    logger.info(f"Server on ws://{bind_host}:{args.port}")
+     logger.info(f"WebSocket options: {serve_kwargs}")
+     async with websockets.serve(
+-        lambda ws: handle_client(ws, args), "0.0.0.0", args.port,
++        lambda ws: handle_client(ws, args), bind_host, args.port,
+         **serve_kwargs,
+     ):
+         await asyncio.Future()

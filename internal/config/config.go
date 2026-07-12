@@ -15,6 +15,7 @@ type Config struct {
 	LLM     LLMConfig
 	VAD     VADConfig
 	ASR     ASRConfig
+	TTS     TTSConfig
 }
 
 type SessionConfig struct {
@@ -39,6 +40,16 @@ type LLMConfig struct {
 	DoubaoModel   string
 	DoubaoTimeout time.Duration
 	Instruction   string
+}
+
+type TTSConfig struct {
+	Provider          string
+	DoubaoURL         string
+	DoubaoAppID       string
+	DoubaoAccessToken string
+	DoubaoResourceID  string
+	DoubaoSpeaker     string
+	SampleRate        int
 }
 
 type ASRConfig struct {
@@ -119,6 +130,7 @@ func Load() Config {
 			AudioBufferSeconds:   envInt("VAD_AUDIO_BUFFER_SECONDS", 5),
 			MaxSpeechMs:          envInt("VAD_MAX_SPEECH_MS", 15000),
 		},
+		TTS: TTSConfig{Provider: envString("TTS_PROVIDER", "none"), DoubaoURL: envString("DOUBAO_TTS_URL", "wss://openspeech.bytedance.com/api/v3/tts/bidirection"), DoubaoAppID: envString("DOUBAO_TTS_APP_ID", ""), DoubaoAccessToken: envString("DOUBAO_TTS_ACCESS_TOKEN", ""), DoubaoResourceID: envString("DOUBAO_TTS_RESOURCE_ID", "volc.service_type.10029"), DoubaoSpeaker: envString("DOUBAO_TTS_SPEAKER", ""), SampleRate: envInt("DOUBAO_TTS_SAMPLE_RATE", 24000)},
 		ASR: ASRConfig{
 			Provider:                           envString("ASR_PROVIDER", "none"),
 			FunASRURL:                          envString("FUNASR_URL", "ws://127.0.0.1:10095"),

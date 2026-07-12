@@ -112,8 +112,8 @@ func main() {
 	}()
 
 	// Stream audio through Silero VAD → FunASR
-	chunkSize := 960 // 30ms at 16kHz 16bit mono (480 samples * 2 bytes)
-	chunkDuration := 30 * time.Millisecond
+	chunkSize := 6400 // 200ms at 16kHz 16bit mono (3200 samples * 2 bytes)
+	chunkDuration := 200 * time.Millisecond
 	segmentCount := 0
 	ctx := context.Background()
 

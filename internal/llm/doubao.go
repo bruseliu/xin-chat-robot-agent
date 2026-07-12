@@ -133,6 +133,9 @@ func (m *DoubaoLLM) newChatRequest(req *model.LLMRequest, stream bool) (doubaoCh
 		Messages: messages,
 		Stream:   stream,
 	}
+	if req.Config != nil {
+		out.MaxTokens = req.Config.MaxOutputTokens
+	}
 	return out, nil
 }
 
@@ -239,9 +242,10 @@ func readErrorBody(body io.Reader) string {
 }
 
 type doubaoChatRequest struct {
-	Model    string          `json:"model"`
-	Messages []doubaoMessage `json:"messages"`
-	Stream   bool            `json:"stream"`
+	Model     string          `json:"model"`
+	Messages  []doubaoMessage `json:"messages"`
+	Stream    bool            `json:"stream"`
+	MaxTokens int32           `json:"max_tokens,omitempty"`
 }
 
 type doubaoMessage struct {

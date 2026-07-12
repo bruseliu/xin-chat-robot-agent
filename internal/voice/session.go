@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
+	"xin-chat-robot-agent/internal/agent"
+	"xin-chat-robot-agent/internal/tts"
 	"xin-chat-robot-agent/internal/vad"
 )
 
@@ -47,11 +50,13 @@ type SegmentEndNotifier interface {
 }
 
 type ASRFactory func(ctx context.Context) (StreamingASR, error)
+type TTSFactory func(ctx context.Context) (tts.Stream, error)
 
 type VoiceSessionConfig struct {
-	UserID    string
-	SessionID string
-	Metadata  map[string]string
+	UserID     string
+	SessionID  string
+	Metadata   map[string]string
+	TTSFactory TTSFactory
 }
 
 type VoiceTurnOutput struct {
@@ -60,6 +65,8 @@ type VoiceTurnOutput struct {
 	Response   TextTurnOutput `json:"response,omitempty"`
 	Final      bool           `json:"final"`
 	Error      string         `json:"error,omitempty"`
+	AudioPCM   []byte         `json:"-"`
+	SampleRate int            `json:"sample_rate,omitempty"`
 }
 
 // VoiceSession is the per-client-connection runtime. Legacy ASR providers finalize
@@ -75,6 +82,8 @@ type VoiceSession struct {
 	endpointing ServerEndpointingASR
 	outputs     chan VoiceTurnOutput
 	ctx         context.Context
+	ttsMu       sync.Mutex
+	activeTTS   tts.Stream
 }
 
 func NewVoiceSession(pipeline *Pipeline, processor vad.AudioProcessor, asr StreamingASR, cfg VoiceSessionConfig) (*VoiceSession, error) {
@@ -171,16 +180,130 @@ func (s *VoiceSession) runTextTurn(ctx context.Context, transcript Transcript) (
 	transcript.IsFinal = true
 	metadata := cloneMetadata(s.cfg.Metadata)
 	metadata["source"] = "voice_session"
-	response, err := s.pipeline.HandleTextTurn(ctx, TextTurnInput{
-		UserID:    s.cfg.UserID,
-		SessionID: s.cfg.SessionID,
-		Text:      strings.TrimSpace(transcript.Text),
-		Metadata:  metadata,
+
+	var speech tts.Stream
+	var speechDone chan struct{}
+	var speechWriteErr error
+	wroteDelta := false
+	textChunker := tts.NewTextChunker(24)
+	startSpeech := func() error {
+		if speech != nil || s.cfg.TTSFactory == nil || s.outputs == nil {
+			return nil
+		}
+		var err error
+		speech, err = s.cfg.TTSFactory(ctx)
+		if err != nil {
+			return err
+		}
+		speechDone = make(chan struct{})
+		s.setActiveTTS(speech)
+		s.outputs <- VoiceTurnOutput{Type: "tts_start", SampleRate: speech.SampleRate()}
+		go s.forwardTTSAudio(speech, speechDone)
+		return nil
+	}
+	defer func() {
+		if speech != nil {
+			s.clearActiveTTS(speech)
+		}
+	}()
+
+	response, err := s.pipeline.HandleTextTurnStream(ctx, TextTurnInput{
+		UserID: s.cfg.UserID, SessionID: s.cfg.SessionID,
+		Text: strings.TrimSpace(transcript.Text), Metadata: metadata,
+	}, func(event agent.StreamEvent) bool {
+		if event.Type != agent.StreamEventLLMDelta || event.TextDelta == "" {
+			return true
+		}
+		if startErr := startSpeech(); startErr != nil {
+			speechWriteErr = startErr
+			return false
+		}
+		s.outputs <- VoiceTurnOutput{Type: "llm_delta", Response: TextTurnOutput{Text: event.TextDelta}}
+		if speech != nil {
+			wroteDelta = true
+			for _, chunk := range textChunker.Push(event.TextDelta) {
+				if speechWriteErr = speech.WriteText(ctx, chunk); speechWriteErr != nil {
+					return false
+				}
+			}
+		}
+		return true
 	})
+	if err == nil && speechWriteErr != nil {
+		err = speechWriteErr
+	}
 	if err != nil {
+		if speech != nil {
+			_ = speech.Cancel(ctx)
+			_ = speech.Close()
+		}
 		return VoiceTurnOutput{}, err
 	}
+	if speech == nil && s.cfg.TTSFactory != nil && strings.TrimSpace(response.Text) != "" {
+		if err := startSpeech(); err != nil {
+			return VoiceTurnOutput{}, err
+		}
+	}
+	if speech != nil {
+		if wroteDelta {
+			if chunk := textChunker.Flush(); chunk != "" {
+				if err := speech.WriteText(ctx, chunk); err != nil {
+					_ = speech.Cancel(ctx)
+					_ = speech.Close()
+					return VoiceTurnOutput{}, err
+				}
+			}
+		}
+		if !wroteDelta && strings.TrimSpace(response.Text) != "" {
+			if err := speech.WriteText(ctx, response.Text); err != nil {
+				_ = speech.Cancel(ctx)
+				_ = speech.Close()
+				return VoiceTurnOutput{}, err
+			}
+		}
+		if err := speech.Finish(ctx); err != nil {
+			_ = speech.Close()
+			return VoiceTurnOutput{}, err
+		}
+		select {
+		case <-speechDone:
+		case <-ctx.Done():
+			_ = speech.Cancel(context.Background())
+			_ = speech.Close()
+			return VoiceTurnOutput{}, ctx.Err()
+		}
+		_ = speech.Close()
+	}
 	return VoiceTurnOutput{Transcript: transcript, Response: response, Final: true}, nil
+}
+
+func (s *VoiceSession) forwardTTSAudio(speech tts.Stream, done chan<- struct{}) {
+	defer close(done)
+	audio, errs := speech.Audio(), speech.Errors()
+	for audio != nil || errs != nil {
+		select {
+		case chunk, ok := <-audio:
+			if !ok {
+				audio = nil
+				continue
+			}
+			if len(chunk.PCM) > 0 {
+				s.outputs <- VoiceTurnOutput{Type: "tts_audio", AudioPCM: chunk.PCM}
+			}
+			if chunk.Final {
+				s.outputs <- VoiceTurnOutput{Type: "tts_end", Final: true}
+			}
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				continue
+			}
+			if err != nil {
+				s.outputs <- VoiceTurnOutput{Type: "tts_error", Error: err.Error()}
+				return
+			}
+		}
+	}
 }
 
 func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (VoiceTurnOutput, error) {
@@ -300,6 +423,18 @@ func (s *VoiceSession) Close() error {
 		return nil
 	}
 	var first error
+	s.ttsMu.Lock()
+	activeTTS := s.activeTTS
+	s.activeTTS = nil
+	s.ttsMu.Unlock()
+	if activeTTS != nil {
+		if err := activeTTS.Cancel(context.Background()); err != nil {
+			first = err
+		}
+		if err := activeTTS.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
 	if err := s.vad.Close(); err != nil {
 		first = err
 	}
@@ -307,6 +442,20 @@ func (s *VoiceSession) Close() error {
 		first = err
 	}
 	return first
+}
+
+func (s *VoiceSession) setActiveTTS(stream tts.Stream) {
+	s.ttsMu.Lock()
+	s.activeTTS = stream
+	s.ttsMu.Unlock()
+}
+
+func (s *VoiceSession) clearActiveTTS(stream tts.Stream) {
+	s.ttsMu.Lock()
+	if s.activeTTS == stream {
+		s.activeTTS = nil
+	}
+	s.ttsMu.Unlock()
 }
 
 func hasAudio(chunk vad.Chunk) bool {

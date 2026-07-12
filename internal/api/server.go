@@ -30,10 +30,11 @@ type Server struct {
 	upgrader   websocket.Upgrader
 	vadFactory VADFactory
 	asrFactory ASRFactory
+	ttsFactory voice.TTSFactory
 	sampleRate int
 }
 
-func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger, vadFactory VADFactory, asrFactory ASRFactory) *Server {
+func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger, vadFactory VADFactory, asrFactory ASRFactory, ttsFactories ...voice.TTSFactory) *Server {
 	if cfg.SampleRate == 0 {
 		cfg.SampleRate = vad.DefaultSampleRate
 	}
@@ -44,6 +45,9 @@ func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger, vadFac
 		vadFactory: vadFactory,
 		asrFactory: asrFactory,
 		sampleRate: cfg.SampleRate,
+	}
+	if len(ttsFactories) > 0 {
+		server.ttsFactory = ttsFactories[0]
 	}
 
 	mux := http.NewServeMux()
@@ -144,6 +148,7 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 		Metadata: map[string]string{
 			"transport": "websocket",
 		},
+		TTSFactory: s.ttsFactory,
 	})
 	if err != nil {
 		if processor != nil {
@@ -160,7 +165,13 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			defer close(writerDone)
 			for output := range outputs {
-				if err := conn.WriteJSON(output); err != nil {
+				var err error
+				if len(output.AudioPCM) > 0 {
+					err = conn.WriteMessage(websocket.BinaryMessage, output.AudioPCM)
+				} else {
+					err = conn.WriteJSON(output)
+				}
+				if err != nil {
 					return
 				}
 			}

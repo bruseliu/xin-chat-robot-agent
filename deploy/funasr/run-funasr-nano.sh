@@ -4,14 +4,14 @@ set -euo pipefail
 : "${FUNASR_HOME:?FUNASR_HOME must point to the Fun-ASR checkout}"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-patch_file="$script_dir/bind-loopback.patch"
+patch_file="$script_dir/segment-end.patch"
 
 if git -C "$FUNASR_HOME" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
   :
 elif git -C "$FUNASR_HOME" apply --check "$patch_file" >/dev/null 2>&1; then
   git -C "$FUNASR_HOME" apply "$patch_file"
 else
-  printf "%s\n" "bind-loopback.patch does not match $FUNASR_HOME/serve_realtime_ws.py" >&2
+  printf "%s\n" "segment-end.patch does not match $FUNASR_HOME/serve_realtime_ws.py" >&2
   exit 1
 fi
 
