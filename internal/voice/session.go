@@ -168,12 +168,15 @@ func (s *VoiceSession) consumeServerEndpointingTranscripts() {
 			s.logger.Info("asr sentence", "text", transcript.Text)
 			s.outputs <- VoiceTurnOutput{Type: "sentence", Transcript: transcript}
 			s.turnActive.Store(true)
-			_, err := s.runTextTurn(s.ctx, transcript)
+			output, err := s.runTextTurn(s.ctx, transcript)
 			s.turnActive.Store(false)
 			if err != nil {
 				s.logger.Error("text turn failed", "error", err, "text", transcript.Text)
 				s.outputs <- VoiceTurnOutput{Type: "turn_error", Transcript: transcript, Final: true, Error: err.Error()}
+				continue
 			}
+			output.Type = "sentence"
+			s.outputs <- output
 		case partial, ok := <-partials:
 			if !ok {
 				partials = nil

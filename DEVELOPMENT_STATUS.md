@@ -1209,3 +1209,81 @@ func (s *ManagedService) AppendEvent(ctx context.Context, sess adksession.Sessio
 2. 实现 barge-in (新语音取消当前 TTS turn)
 3. 接入 mem0 记忆注入到 LLM prompt
 4. 配置 PostgreSQL 做 session 持久化
+
+---
+
+## Development Log: mem0 读取/异步写入与本地数据库计划 (2026-07-13)
+
+> 本节覆盖上文关于“mem0 未注入 prompt”的旧状态。
+
+### 已完成的工程接入
+
+- `cmd/server/llm_gemini.go`：在 ADK `BeforeModelCallback` 中读取最后一条用户文本；文本少于 4 个字符时跳过。检索以 `user_id + query` 调用 mem0，并将返回记忆作为 `[记忆上下文]` 插入本轮 LLM 请求。
+- `internal/voice/pipeline.go`：LLM 成功生成回复后，将 user/assistant 消息提交给 `memory.Writer`，不阻塞语音与 TTS 响应。
+- `internal/memory/writer.go`：同一用户的写入串行化，跨用户最多 5 路并发，默认队列深度 64；队列满时丢弃最旧请求。
+- `internal/memory/writer_test.go`：覆盖同用户写入顺序、队列满时淘汰最旧请求、全局并发限制；`go test -race ./internal/memory ./internal/voice ./internal/api` 通过。
+
+### 当前检索和写入策略
+
+- 检索不是全量历史注入：调用 mem0 `/search`，按当前 `user_id` 过滤，使用当前问题做语义检索，返回 `MEM0_TOP_K` 条（默认 8 条）。
+- 当前 Go 服务不做二次排序、最低分阈值或 token 预算；mem0 的排序策略由其向量库/配置决定。
+- 写入调用 mem0 `/memories`；是否使用 LLM 提炼、去重由 mem0 服务端的 `infer` 默认行为与其 LLM 配置决定。
+- 成功检索会记录 `memory injected`（用户 ID 与条数）；检索失败和写入失败会记录 warning。当前尚未记录写入成功、记忆 ID 或相似度分数，且不应默认记录记忆正文以避免泄露用户隐私。
+
+### 当前运行状态
+
+应用配置为：
+
+```text
+MEM0_MODE=self_hosted
+MEM0_BASE_URL=http://localhost:8888
+```
+
+截至本次记录，本机 `localhost:8888` 尚无 mem0 服务监听。因此应用可正常对话，但 mem0 检索会降级为空，异步写入会失败且不会持久化。应用侧“入队”不等于 mem0 已成功落库。
+
+本机 mem0 源码位于 `/data/liuxin/mem0`。其 `server/docker-compose.yaml` 的 API 映射正是 `localhost:8888`，可与现有 Go 配置直接对接。
+
+### FastEmbed 本地 embedding 方案
+
+已决定避免豆包 embedding 计费，改用 `FastEmbed` 在 mem0 API 进程内运行本地 ONNX embedding：
+
+- 不需要 embedding HTTP 服务，也不调用云端 embedding API。
+- mem0 核心库已提供 `FastEmbedEmbedding`，但当前 `server/main.py` 的 API provider 白名单仅包含 `openai`、`gemini`，容器依赖也未安装 `fastembed` extra。
+- 启动前需要修改 mem0 服务层：安装 `mem0ai[fastembed]`、将 `fastembed` 加入 `BUNDLED_EMBEDDER_PROVIDERS`、通过环境变量将默认 embedder 配置为 `fastembed` 和选定的多语言模型。
+- 记忆提炼仍需要一个 LLM。可继续复用现有豆包 OpenAI 兼容接口；只有新增/更新记忆时会调用它，不用于 embedding。
+
+### PostgreSQL / pgvector（原生部署）
+
+mem0 的 `server/` API 不提供 SQLite 回退，需使用启用 `pgvector` 的 PostgreSQL。当前工作站为 Ubuntu 24.04，尚未安装 PostgreSQL。推荐原生安装 PostgreSQL 16 与 pgvector：
+
+```bash
+sudo apt update
+sudo apt install -y postgresql-16 postgresql-client-16 postgresql-server-dev-16 build-essential git
+git clone --branch v0.8.0 https://github.com/pgvector/pgvector.git /tmp/pgvector
+cd /tmp/pgvector && make && sudo make install
+sudo systemctl enable --now postgresql
+```
+
+初始化 mem0 数据库：
+
+```sql
+CREATE USER mem0 WITH PASSWORD '<strong-password>';
+CREATE DATABASE mem0 OWNER mem0;
+\c mem0
+CREATE EXTENSION vector;
+```
+
+验证扩展：
+
+```bash
+psql "postgresql://mem0:<strong-password>@127.0.0.1:5432/mem0" \
+  -c "SELECT extname FROM pg_extension WHERE extname = 'vector';"
+```
+
+### 后续步骤
+
+1. 安装 PostgreSQL 16 与 pgvector，创建 `mem0` 数据库和受限用户。
+2. 修改 `/data/liuxin/mem0/server` 以启用 `FastEmbed`，并配置本地多语言 embedding 模型。
+3. 配置 mem0 的记忆提炼 LLM、认证和 PostgreSQL 连接；本地开发可用 `AUTH_DISABLED=true`，生产环境必须启用 API key/JWT。
+4. 启动 mem0 API 到 `localhost:8888`，验证 `/docs`、`/search`、`/memories`。
+5. 用真实多轮语音验证：写入成功、随后查询命中、`[记忆上下文]` 注入 LLM；补充 mem0 HTTP 集成测试和安全的结构化召回日志。

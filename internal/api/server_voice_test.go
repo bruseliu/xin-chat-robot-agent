@@ -10,13 +10,12 @@ import (
 	"github.com/gorilla/websocket"
 
 	"xin-chat-robot-agent/internal/agent"
-	"xin-chat-robot-agent/internal/memory"
 	"xin-chat-robot-agent/internal/vad"
 	"xin-chat-robot-agent/internal/voice"
 )
 
 func TestVoiceWebSocketRunsVoiceSession(t *testing.T) {
-	pipeline := voice.NewPipeline(fakeAPIRunner{}, fakeAPIMemory{}, slog.Default())
+	pipeline := voice.NewPipeline(fakeAPIRunner{}, nil, slog.Default())
 	server := NewServer(Config{SampleRate: 16000}, pipeline, slog.Default(),
 		func() (vad.AudioProcessor, error) {
 			return &apiFakeVAD{out: vad.AudioOutput{Chunk: vad.Chunk{PCM16LE: []byte{1, 0}, SampleRate: 16000}, VADEnd: true}}, nil
@@ -85,11 +84,3 @@ func (fakeAPIRunner) RunTurnStream(_ context.Context, input agent.TurnInput, yie
 	}
 	return agent.TurnOutput{Text: text}, nil
 }
-
-type fakeAPIMemory struct{}
-
-func (fakeAPIMemory) Search(context.Context, memory.SearchRequest) ([]memory.Memory, error) {
-	return nil, nil
-}
-
-func (fakeAPIMemory) Add(context.Context, memory.AddRequest) error { return nil }

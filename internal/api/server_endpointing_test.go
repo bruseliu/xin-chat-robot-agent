@@ -16,7 +16,7 @@ import (
 )
 
 func TestVoiceWebSocketStreamsProviderSentenceEnd(t *testing.T) {
-	pipeline := voice.NewPipeline(fakeAPIRunner{}, fakeAPIMemory{}, slog.Default())
+	pipeline := voice.NewPipeline(fakeAPIRunner{}, nil, slog.Default())
 	asr := &apiServerEndpointingASR{sentences: make(chan voice.Transcript, 1)}
 	server := NewServer(Config{SampleRate: 16000}, pipeline, slog.Default(),
 		func() (vad.AudioProcessor, error) {
@@ -39,17 +39,25 @@ func TestVoiceWebSocketStreamsProviderSentenceEnd(t *testing.T) {
 	if err := conn.WriteMessage(websocket.BinaryMessage, []byte{1, 0}); err != nil {
 		t.Fatalf("WriteMessage() error = %v", err)
 	}
-	var response voice.VoiceTurnOutput
-	if err := conn.ReadJSON(&response); err != nil {
-		t.Fatalf("ReadJSON() error = %v", err)
-	}
-	if response.Type != "sentence" || response.Transcript.Text != "FunASR句末" || response.Response.Text != "agent: FunASR句末" || !response.Final {
-		t.Fatalf("response = %+v", response)
+	for i := 0; i < 2; i++ {
+		var response voice.VoiceTurnOutput
+		if err := conn.ReadJSON(&response); err != nil {
+			t.Fatalf("ReadJSON() error = %v", err)
+		}
+		if i == 0 {
+			if response.Type != "sentence" || response.Transcript.Text != "FunASR句末" || response.Final {
+				t.Fatalf("initial response = %+v", response)
+			}
+			continue
+		}
+		if response.Type != "sentence" || response.Transcript.Text != "FunASR句末" || response.Response.Text != "agent: FunASR句末" || !response.Final {
+			t.Fatalf("completed response = %+v", response)
+		}
 	}
 }
 
 func TestVoiceWebSocketWritesTTSAudioAsBinaryFrame(t *testing.T) {
-	pipeline := voice.NewPipeline(fakeAPIRunner{}, fakeAPIMemory{}, slog.Default())
+	pipeline := voice.NewPipeline(fakeAPIRunner{}, nil, slog.Default())
 	asr := &apiServerEndpointingASR{sentences: make(chan voice.Transcript, 1)}
 	server := NewServer(Config{SampleRate: 16000}, pipeline, slog.Default(),
 		func() (vad.AudioProcessor, error) {

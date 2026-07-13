@@ -115,7 +115,10 @@ async def recv_messages(ws: websockets.WebSocketClientProtocol, player: TTSPlaye
                     sys.stdout.write("\r\033[K")
                     sys.stdout.flush()
                     last_partial = ""
-                print(f"  [ASR final] {text}")
+                # The server first emits the recognized sentence, then emits a
+                # final turn-complete frame with the same transcript after LLM/TTS.
+                if not msg.get("final", False):
+                    print(f"  [ASR final] {text}")
 
             elif msg_type == "llm_delta":
                 delta = msg.get("response", {}).get("text", "")

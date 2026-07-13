@@ -11,7 +11,7 @@ import (
 
 func TestVoiceSessionUsesProviderSentenceEndWithoutRotatingASR(t *testing.T) {
 	runner := &fakeRunner{}
-	pipeline := NewPipeline(runner, &fakeMemory{}, slog.Default())
+	pipeline := NewPipeline(runner, nil, slog.Default())
 	processor := &fakeVoiceVAD{out: vad.AudioOutput{
 		Chunk:  vad.Chunk{Samples: []float32{0.1}, SampleRate: 16000},
 		VADEnd: true,
@@ -38,11 +38,19 @@ func TestVoiceSessionUsesProviderSentenceEndWithoutRotatingASR(t *testing.T) {
 	asr.sentences <- Transcript{Text: "你好世界", IsFinal: true}
 	select {
 	case result := <-session.Outputs():
-		if result.Type != "sentence" || result.Transcript.Text != "你好世界" || result.Response.Text != "agent: 你好世界" || !result.Final {
-			t.Fatalf("provider sentence output = %+v", result)
+		if result.Type != "sentence" || result.Transcript.Text != "你好世界" || result.Final {
+			t.Fatalf("initial provider sentence output = %+v", result)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for provider sentence output")
+	}
+	select {
+	case result := <-session.Outputs():
+		if result.Type != "sentence" || result.Transcript.Text != "你好世界" || result.Response.Text != "agent: 你好世界" || !result.Final {
+			t.Fatalf("completed provider sentence output = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for completed provider sentence output")
 	}
 	if runner.calls != 1 || runner.last.Text != "你好世界" {
 		t.Fatalf("runner calls/text = %d/%q, want 1/你好世界", runner.calls, runner.last.Text)

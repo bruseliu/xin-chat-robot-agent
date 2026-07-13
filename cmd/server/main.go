@@ -68,7 +68,7 @@ func main() {
 		logger.Info("adk graph", "edge", line)
 	}
 
-	rootAgent, err := newLLMAgent(context.Background(), cfg.LLM, cfg.AgentID)
+	rootAgent, err := newLLMAgent(context.Background(), cfg.LLM, cfg.AgentID, memClient, logger)
 	if err != nil {
 		logger.Error("create ADK LLM agent failed", "error", err)
 		os.Exit(1)
@@ -85,7 +85,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	pipeline := voice.NewPipeline(agentRunner, memClient, logger)
+	memWriter := memory.NewWriter(memClient, memory.WriterConfig{}, logger)
+	pipeline := voice.NewPipeline(agentRunner, memWriter, logger)
 	ttsFactory, err := newTTSFactory(cfg.TTS)
 	if err != nil {
 		logger.Error("create TTS factory failed", "error", err)

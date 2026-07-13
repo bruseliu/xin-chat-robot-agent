@@ -6,12 +6,11 @@ import (
 	"testing"
 
 	"xin-chat-robot-agent/internal/agent"
-	"xin-chat-robot-agent/internal/memory"
 	"xin-chat-robot-agent/internal/vad"
 )
 
 func TestVoiceSessionWritesASRUntilFinalAudio(t *testing.T) {
-	pipeline := NewPipeline(&fakeRunner{}, &fakeMemory{}, slog.Default())
+	pipeline := NewPipeline(&fakeRunner{}, nil, slog.Default())
 	processor := &fakeVoiceVAD{out: vad.AudioOutput{
 		Chunk: vad.Chunk{Samples: []float32{0.1, 0.2}, SampleRate: 16000},
 	}}
@@ -38,7 +37,7 @@ func TestVoiceSessionWritesASRUntilFinalAudio(t *testing.T) {
 
 func TestVoiceSessionFinalizesASROnVADEnd(t *testing.T) {
 	runner := &fakeRunner{}
-	pipeline := NewPipeline(runner, &fakeMemory{}, slog.Default())
+	pipeline := NewPipeline(runner, nil, slog.Default())
 	processor := &fakeVoiceVAD{out: vad.AudioOutput{
 		Chunk:  vad.Chunk{Samples: []float32{0.1}, SampleRate: 16000},
 		VADEnd: true,
@@ -69,7 +68,7 @@ func TestVoiceSessionFinalizesASROnVADEnd(t *testing.T) {
 
 func TestVoiceSessionRotatesASRAfterVADEnd(t *testing.T) {
 	runner := &fakeRunner{}
-	pipeline := NewPipeline(runner, &fakeMemory{}, slog.Default())
+	pipeline := NewPipeline(runner, nil, slog.Default())
 	processor := &fakeVoiceVAD{out: vad.AudioOutput{
 		Chunk:  vad.Chunk{Samples: []float32{0.1}, SampleRate: 16000},
 		VADEnd: true,
@@ -104,7 +103,7 @@ func TestVoiceSessionRotatesASRAfterVADEnd(t *testing.T) {
 
 func TestVoiceSessionRunsTextTurnOnFinalAudio(t *testing.T) {
 	runner := &fakeRunner{}
-	pipeline := NewPipeline(runner, &fakeMemory{}, slog.Default())
+	pipeline := NewPipeline(runner, nil, slog.Default())
 	processor := &fakeVoiceVAD{out: vad.AudioOutput{
 		Chunk:  vad.Chunk{Samples: []float32{0.1}, SampleRate: 16000},
 		VADEnd: true,
@@ -186,14 +185,4 @@ func (f *fakeRunner) RunTurnStream(_ context.Context, input agent.TurnInput, yie
 		yield(agent.StreamEvent{Type: agent.StreamEventLLMFinal, Text: text, Final: true})
 	}
 	return agent.TurnOutput{Text: text}, nil
-}
-
-type fakeMemory struct{}
-
-func (fakeMemory) Search(context.Context, memory.SearchRequest) ([]memory.Memory, error) {
-	return nil, nil
-}
-
-func (fakeMemory) Add(context.Context, memory.AddRequest) error {
-	return nil
 }

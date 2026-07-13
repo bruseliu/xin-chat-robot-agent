@@ -13,7 +13,7 @@ import (
 
 func TestVoiceSessionStreamsLLMDeltasThroughTTS(t *testing.T) {
 	runner := streamingTTSRunner{}
-	pipeline := NewPipeline(runner, &fakeMemory{}, slog.Default())
+	pipeline := NewPipeline(runner, nil, slog.Default())
 	asr := &fakeServerEndpointingASR{sentences: make(chan Transcript, 1), partials: make(chan Transcript)}
 	close(asr.partials)
 	fake := newFakeTTSStream()
@@ -38,7 +38,7 @@ func TestVoiceSessionStreamsLLMDeltasThroughTTS(t *testing.T) {
 			if len(out.AudioPCM) > 0 {
 				pcm = append(pcm, out.AudioPCM...)
 			}
-			if out.Type == "sentence" {
+			if out.Type == "sentence" && out.Final {
 				if out.Response.Text != "你好" {
 					t.Fatalf("response = %q", out.Response.Text)
 				}
@@ -51,7 +51,7 @@ func TestVoiceSessionStreamsLLMDeltasThroughTTS(t *testing.T) {
 				if len(texts) != 1 || texts[0] != "你好" {
 					t.Fatalf("tts texts = %v", texts)
 				}
-				want := []string{"tts_start", "llm_delta", "llm_delta", "tts_audio", "tts_end", "sentence"}
+				want := []string{"sentence", "tts_start", "llm_delta", "llm_delta", "tts_audio", "tts_end", "sentence"}
 				if len(types) != len(want) {
 					t.Fatalf("types = %v", types)
 				}
