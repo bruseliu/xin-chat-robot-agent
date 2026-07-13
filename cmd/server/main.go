@@ -16,6 +16,8 @@ import (
 	"xin-chat-robot-agent/internal/sessionstore"
 	"xin-chat-robot-agent/internal/vad"
 	"xin-chat-robot-agent/internal/voice"
+
+	adksession "google.golang.org/adk/v2/session"
 )
 
 func main() {
@@ -32,13 +34,25 @@ func main() {
 		Timeout: cfg.Mem0.Timeout,
 	}, logger)
 
-	sessionService, err := sessionstore.NewPostgresService(sessionstore.PostgresConfig{
-		DSN:         cfg.Session.PostgresDSN,
-		AutoMigrate: cfg.Session.AutoMigrate,
-	})
-	if err != nil {
-		logger.Error("create ADK session service failed", "error", err)
-		os.Exit(1)
+	var sessionService adksession.Service
+	if cfg.Session.PostgresDSN != "" {
+		svc, err := sessionstore.NewPostgresService(sessionstore.PostgresConfig{
+			DSN:         cfg.Session.PostgresDSN,
+			AutoMigrate: cfg.Session.AutoMigrate,
+		})
+		if err != nil {
+			logger.Error("create ADK session service failed", "error", err)
+			os.Exit(1)
+		}
+		sessionService = svc
+	} else {
+		logger.Warn("ADK_SESSION_POSTGRES_DSN not set, using in-memory session store")
+		svc, err := sessionstore.NewInMemoryManagedService(sessionstore.Config{})
+		if err != nil {
+			logger.Error("create in-memory session service failed", "error", err)
+			os.Exit(1)
+		}
+		sessionService = svc
 	}
 	adkMemoryService := memory.NewADKService(memClient, cfg.AgentID, cfg.Mem0.TopK)
 
@@ -85,7 +99,7 @@ func main() {
 			return newVADDetector(cfg.VAD)
 		},
 		func(ctx context.Context) (voice.StreamingASR, error) {
-			return newASRStream(ctx, cfg.ASR)
+			return newASRStream(ctx, cfg.ASR, logger)
 		},
 		ttsFactory,
 	)

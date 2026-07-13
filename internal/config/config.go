@@ -116,7 +116,7 @@ func Load() Config {
 			DoubaoAPIKey:  envString("DOUBAO_LLM_API_KEY", envString("ARK_API_KEY", "")),
 			DoubaoModel:   envString("DOUBAO_LLM_MODEL", ""),
 			DoubaoTimeout: time.Duration(envInt("DOUBAO_LLM_TIMEOUT_SECONDS", 60)) * time.Second,
-			Instruction:   envString("AGENT_INSTRUCTION", "You are a realtime voice assistant. Keep answers natural, concise, and suitable for TTS."),
+			Instruction:   envString("AGENT_INSTRUCTION", "你是一个实时语音助手。请用自然、简洁的中文回答，适合语音朗读，不要使用 Markdown 格式。"),
 		},
 		VAD: VADConfig{
 			Provider:             envString("VAD_PROVIDER", "none"),

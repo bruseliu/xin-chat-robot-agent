@@ -87,7 +87,7 @@ func TestFunASRASRStreamingLifecycle(t *testing.T) {
 		ReadTimeout:  time.Second,
 		WriteTimeout: time.Second,
 		DialTimeout:  time.Second,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("NewFunASRASR() error = %v", err)
 	}
@@ -118,7 +118,7 @@ func TestFunASRASRStreamingLifecycle(t *testing.T) {
 }
 
 func TestFunASRASRRequires16K(t *testing.T) {
-	if _, err := NewFunASRASR(context.Background(), FunASRASRConfig{SampleRate: 8000}); err == nil {
+	if _, err := NewFunASRASR(context.Background(), FunASRASRConfig{SampleRate: 8000}, nil); err == nil {
 		t.Fatal("NewFunASRASR() error = nil, want invalid sample rate")
 	}
 }

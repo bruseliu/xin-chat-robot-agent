@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"sync"
@@ -28,8 +29,9 @@ type FunASRASRConfig struct {
 
 // FunASRASR keeps one private Fun-ASR session open for the whole microphone stream.
 type FunASRASR struct {
-	cfg  FunASRASRConfig
-	conn *websocket.Conn
+	cfg    FunASRASRConfig
+	conn   *websocket.Conn
+	logger *slog.Logger
 
 	writeMu  sync.Mutex
 	stateMu  sync.Mutex
@@ -46,24 +48,31 @@ type FunASRASR struct {
 var _ StreamingASR = (*FunASRASR)(nil)
 var _ ServerEndpointingASR = (*FunASRASR)(nil)
 
-func NewFunASRASR(ctx context.Context, cfg FunASRASRConfig) (*FunASRASR, error) {
+func NewFunASRASR(ctx context.Context, cfg FunASRASRConfig, logger *slog.Logger) (*FunASRASR, error) {
 	cfg = normalizeFunASRASRConfig(cfg)
 	if err := validateFunASRASRConfig(cfg); err != nil {
 		return nil, err
 	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger = logger.With("component", "funasr_asr", "url", cfg.URL)
 	dialer := cfg.WebSocketDialer
 	if dialer == nil {
 		base := *websocket.DefaultDialer
 		base.HandshakeTimeout = cfg.DialTimeout
 		dialer = &base
 	}
+	logger.Info("connecting to funasr")
 	conn, _, err := dialer.DialContext(ctx, cfg.URL, nil)
 	if err != nil {
+		logger.Error("funasr dial failed", "error", err)
 		return nil, fmt.Errorf("funasr websocket dial: %w", err)
 	}
 	stream := &FunASRASR{
 		cfg:       cfg,
 		conn:      conn,
+		logger:    logger,
 		sentences: make(chan Transcript, 32),
 		partials:  make(chan Transcript, 16),
 		completed: make(chan error, 1),
@@ -77,6 +86,7 @@ func NewFunASRASR(ctx context.Context, cfg FunASRASRConfig) (*FunASRASR, error) 
 		_ = conn.Close()
 		return nil, err
 	}
+	logger.Info("funasr session started")
 	go stream.readLoop()
 	return stream, nil
 }
@@ -168,6 +178,7 @@ func (s *FunASRASR) NotifySegmentEnd(ctx context.Context) error {
 	if s.isStopping() {
 		return fmt.Errorf("funasr stream is stopping")
 	}
+	s.logger.Info("sending SEGMENT_END to funasr")
 	return s.writeMessage(ctx, websocket.TextMessage, []byte("SEGMENT_END"))
 }
 
@@ -244,6 +255,7 @@ func (s *FunASRASR) readLoop() {
 		messageType, data, err := s.conn.ReadMessage()
 		if err != nil {
 			if !s.isClosed() {
+				s.logger.Error("funasr read error", "error", err)
 				s.publishCompleted(fmt.Errorf("read funasr response: %w", err))
 			}
 			return
@@ -286,6 +298,7 @@ func (s *FunASRASR) publishSentence(sentence funASRSentence) {
 		return
 	}
 	s.seen[key] = struct{}{}
+	s.logger.Info("funasr sentence", "text", text, "start_ms", sentence.Start, "end_ms", sentence.End)
 	transcript := Transcript{Text: text, IsFinal: true}
 	s.updateLatest(transcript)
 	select {
@@ -391,9 +404,6 @@ func parseFunASRResponse(data []byte) (funASRResponse, error) {
 	var response funASRResponse
 	if err := json.Unmarshal(data, &response); err != nil {
 		return funASRResponse{}, fmt.Errorf("decode funasr response: %w", err)
-	}
-	if response.Event == "" && len(response.Sentences) == 0 && response.Partial == "" && !response.IsFinal && response.Error == "" {
-		return funASRResponse{}, fmt.Errorf("funasr response has no event or result")
 	}
 	return response, nil
 }

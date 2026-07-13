@@ -101,32 +101,17 @@ func (s *ManagedService) AppendEvent(ctx context.Context, sess adksession.Sessio
 	if event == nil {
 		return fmt.Errorf("sessionstore: event is nil")
 	}
-	current, err := s.inner.Get(ctx, &adksession.GetRequest{
-		AppName:   sess.AppName(),
-		UserID:    sess.UserID(),
-		SessionID: sess.ID(),
-	})
-	if err != nil {
-		return fmt.Errorf("sessionstore: cannot append event to missing session: %w", err)
+	// Unwrap sessionView so the inner service receives the concrete *session
+	// it can mutate in-place. This ensures the caller's session reference
+	// reflects the newly appended event (critical for ADK runner correctness).
+	target := sess
+	if sv, ok := sess.(sessionView); ok {
+		target = sv.inner
 	}
-	if current == nil || current.Session == nil {
-		return fmt.Errorf("sessionstore: cannot append event to missing session")
-	}
-
-	s.record(current.Session)
-	if err := s.inner.AppendEvent(ctx, current.Session, event); err != nil {
+	if err := s.inner.AppendEvent(ctx, target, event); err != nil {
 		return err
 	}
-	refreshed, err := s.inner.Get(ctx, &adksession.GetRequest{
-		AppName:   current.Session.AppName(),
-		UserID:    current.Session.UserID(),
-		SessionID: current.Session.ID(),
-	})
-	if err == nil && refreshed != nil && refreshed.Session != nil {
-		s.record(refreshed.Session)
-		return nil
-	}
-	s.record(current.Session)
+	s.record(target)
 	return nil
 }
 

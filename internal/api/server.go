@@ -134,6 +134,8 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	s.logger.Info("voice websocket connected", "user_id", userID, "session_id", sessionID, "sample_rate", sampleRate, "remote_addr", r.RemoteAddr)
+
 	closeSession := func() {}
 
 	processor, err := s.vadFactory()
@@ -189,6 +191,7 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 	for {
 		messageType, payload, err := conn.ReadMessage()
 		if err != nil {
+			s.logger.Info("voice websocket closed", "user_id", userID, "error", err)
 			return
 		}
 		switch messageType {

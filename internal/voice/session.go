@@ -3,8 +3,10 @@ package voice
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"xin-chat-robot-agent/internal/agent"
 	"xin-chat-robot-agent/internal/tts"
@@ -84,6 +86,8 @@ type VoiceSession struct {
 	ctx         context.Context
 	ttsMu       sync.Mutex
 	activeTTS   tts.Stream
+	logger      *slog.Logger
+	turnActive  atomic.Bool
 }
 
 func NewVoiceSession(pipeline *Pipeline, processor vad.AudioProcessor, asr StreamingASR, cfg VoiceSessionConfig) (*VoiceSession, error) {
@@ -114,6 +118,7 @@ func newVoiceSession(ctx context.Context, pipeline *Pipeline, processor vad.Audi
 	if strings.TrimSpace(cfg.UserID) == "" {
 		return nil, fmt.Errorf("voice session requires user id")
 	}
+	logger := pipeline.logger.With("user_id", cfg.UserID, "session_id", cfg.SessionID)
 	session := &VoiceSession{
 		pipeline:   pipeline,
 		vad:        processor,
@@ -121,6 +126,7 @@ func newVoiceSession(ctx context.Context, pipeline *Pipeline, processor vad.Audi
 		asrFactory: factory,
 		cfg:        cfg,
 		ctx:        ctx,
+		logger:     logger,
 	}
 	if session.ctx == nil {
 		session.ctx = context.Background()
@@ -128,7 +134,10 @@ func newVoiceSession(ctx context.Context, pipeline *Pipeline, processor vad.Audi
 	if endpointing, ok := asr.(ServerEndpointingASR); ok {
 		session.endpointing = endpointing
 		session.outputs = make(chan VoiceTurnOutput, 16)
+		logger.Info("voice session started", "mode", "server_endpointing")
 		go session.consumeServerEndpointingTranscripts()
+	} else {
+		logger.Info("voice session started", "mode", "local_vad")
 	}
 	return session, nil
 }
@@ -156,13 +165,15 @@ func (s *VoiceSession) consumeServerEndpointingTranscripts() {
 			if !transcript.IsFinal || strings.TrimSpace(transcript.Text) == "" {
 				continue
 			}
-			output, err := s.runTextTurn(s.ctx, transcript)
+			s.logger.Info("asr sentence", "text", transcript.Text)
+			s.outputs <- VoiceTurnOutput{Type: "sentence", Transcript: transcript}
+			s.turnActive.Store(true)
+			_, err := s.runTextTurn(s.ctx, transcript)
+			s.turnActive.Store(false)
 			if err != nil {
-				output = VoiceTurnOutput{Type: "sentence", Transcript: transcript, Final: true, Error: err.Error()}
-			} else {
-				output.Type = "sentence"
+				s.logger.Error("text turn failed", "error", err, "text", transcript.Text)
+				s.outputs <- VoiceTurnOutput{Type: "turn_error", Transcript: transcript, Final: true, Error: err.Error()}
 			}
-			s.outputs <- output
 		case partial, ok := <-partials:
 			if !ok {
 				partials = nil
@@ -193,8 +204,10 @@ func (s *VoiceSession) runTextTurn(ctx context.Context, transcript Transcript) (
 		var err error
 		speech, err = s.cfg.TTSFactory(ctx)
 		if err != nil {
+			s.logger.Error("tts create failed", "error", err)
 			return err
 		}
+		s.logger.Info("tts started", "sample_rate", speech.SampleRate())
 		speechDone = make(chan struct{})
 		s.setActiveTTS(speech)
 		s.outputs <- VoiceTurnOutput{Type: "tts_start", SampleRate: speech.SampleRate()}
@@ -332,9 +345,14 @@ func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (Voic
 			}
 			return VoiceTurnOutput{Final: true}, nil
 		}
+		if s.turnActive.Load() {
+			return VoiceTurnOutput{Final: false}, nil
+		}
 		if vadOut.VADEnd {
+			s.logger.Info("vad end detected, sending SEGMENT_END")
 			if notifier, ok := s.endpointing.(SegmentEndNotifier); ok {
 				if err := notifier.NotifySegmentEnd(ctx); err != nil {
+					s.logger.Error("segment_end failed", "error", err)
 					return VoiceTurnOutput{}, err
 				}
 			}

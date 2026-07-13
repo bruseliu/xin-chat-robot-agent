@@ -912,3 +912,300 @@ The next implementation milestone is a real microphone end-to-end client for `/v
 7. Add a deterministic TTS text sanitizer before production tuning.
 
 After this E2E client is stable, implement barge-in/interruption tests and then validate PostgreSQL session storage plus mem0 behavior under multi-turn voice conversations.
+
+---
+
+## Development Log: 全链路日志 + Python 客户端 + In-Memory Session Fallback (2026-07-13)
+
+### 本轮改动概要
+
+1. **VAD 切换到 Silero** — `.env` 中 `VAD_PROVIDER=passthrough` → `VAD_PROVIDER=silero`
+2. **全链路结构化日志** — 在 voice pipeline 各层加入 `slog` 日志
+3. **Python 实时语音客户端** — `client/voice_client.py`
+4. **In-Memory Session Fallback** — 无 PostgreSQL 时自动用内存 session store 启动
+
+---
+
+### 1. VAD 切换
+
+改动文件: `.env`
+
+```diff
+-VAD_PROVIDER=passthrough
++VAD_PROVIDER=silero
+```
+
+`passthrough` 模式下 Silero VAD 不参与，所有音频原封发到 FunASR，`VADEnd` 永远不触发，`SEGMENT_END` 因此也不会发出。切换到 `silero` 后，本地 Silero VAD 检测 speech end → 触发 `NotifySegmentEnd` → 服务端 force decode。
+
+---
+
+### 2. 全链路结构化日志
+
+#### `internal/voice/session.go`
+
+已有 `pipeline.logger`，新增：
+- `logger *slog.Logger` 字段，挂在 VoiceSession 上
+- 从 `pipeline.logger.With("user_id", ..., "session_id", ...)` 派生
+- 日志点:
+  - session 启动（mode = server_endpointing / local_vad）
+  - ASR sentence 收到（text）
+  - text turn 失败（error + text）
+  - VAD end 检测到，发送 SEGMENT_END
+  - SEGMENT_END 发送失败
+  - TTS 创建成功（sample_rate）/ 失败（error）
+
+#### `internal/voice/funasr_asr.go`
+
+新增 `logger *slog.Logger` 字段，`NewFunASRASR` 签名变为:
+
+```go
+func NewFunASRASR(ctx context.Context, cfg FunASRASRConfig, logger *slog.Logger) (*FunASRASR, error)
+```
+
+日志点:
+- 连接 FunASR（connecting）
+- 连接失败（dial failed + error）
+- session started
+- 发送 SEGMENT_END
+- 收到 sentence（text + start_ms + end_ms）
+- 读循环错误（read error）
+
+#### `internal/api/server.go`
+
+日志点:
+- voice WebSocket 连接建立（user_id, session_id, sample_rate, remote_addr）
+- voice WebSocket 关闭（user_id + error reason）
+
+#### `cmd/server/asr_doubao.go`
+
+`newASRStream` 签名变为:
+
+```go
+func newASRStream(ctx context.Context, cfg config.ASRConfig, logger *slog.Logger) (voice.StreamingASR, error)
+```
+
+logger 从 `cmd/server/main.go` 传入。
+
+---
+
+### 3. Python 实时语音客户端
+
+新增文件:
+- `client/voice_client.py`
+- `client/requirements.txt`
+
+功能:
+- PyAudio 录音（16kHz, 16bit, mono, 200ms chunk）
+- websockets 异步连接 `ws://127.0.0.1:8080/v1/chat/voice`
+- 接收并打印: ASR partial（\r 覆盖）、ASR sentence、LLM delta（inline）
+- 接收 TTS PCM binary 并通过 PyAudio 播放
+- Ctrl+C 发 `{"type":"final"}` 优雅退出
+
+运行方式:
+
+```bash
+cd client
+pip install -r requirements.txt
+python voice_client.py
+```
+
+---
+
+### 4. In-Memory Session Store Fallback
+
+改动文件: `cmd/server/main.go`
+
+当 `ADK_SESSION_POSTGRES_DSN` 为空时，不再报错退出，而是使用 `sessionstore.NewInMemoryManagedService` 作为 session backend:
+
+```go
+if cfg.Session.PostgresDSN != "" {
+    sessionService = sessionstore.NewPostgresService(...)
+} else {
+    logger.Warn("ADK_SESSION_POSTGRES_DSN not set, using in-memory session store")
+    sessionService = sessionstore.NewInMemoryManagedService(sessionstore.Config{})
+}
+```
+
+这允许在没有 PostgreSQL 的开发环境中直接启动服务进行实时语音调试。会话数据不持久化，进程重启后丢失。
+
+---
+
+### 5. 编译验证
+
+```bash
+go build ./cmd/... ./internal/...   # 通过
+go test ./internal/voice/ -run TestFunASR -v  # PASS
+curl http://127.0.0.1:8080/healthz  # {"status":"ok"}
+```
+
+服务已在本地 `:8080` 运行。
+
+---
+
+### 当前状态
+
+| 组件 | 状态 |
+|------|------|
+| Silero VAD | ✅ 已启用 |
+| FunASR ASR | ✅ 连接中 (ws://127.0.0.1:10095) |
+| SEGMENT_END 协议 | ✅ 已验证 (64-90ms) |
+| Doubao LLM 流式 | ✅ SSE streaming |
+| Doubao TTS 流式 | ✅ bidirectional WebSocket |
+| 全链路日志 | ✅ 本轮新增 |
+| Python 客户端 | ✅ 本轮新增 |
+| In-Memory Session | ✅ 本轮新增 (fallback) |
+| 记忆查询接入 LLM | ❌ mem0 查询已实现但结果未注入 prompt |
+| Barge-in/打断 | ❌ 未实现 |
+| PostgreSQL Session | ⚠️ 可选，需配置 DSN |
+
+---
+
+## Development Log: 全链路 E2E 调试 + Off-by-one Session Bug 修复 (2026-07-13 续)
+
+### 本轮改动概要
+
+通过 Python 客户端真实麦克风 E2E 测试，逐步发现并修复了 5 个 bug，最终实现完整的 VAD→ASR→LLM→TTS 实时语音对话。
+
+---
+
+### 1. FunASR readLoop 死亡修复
+
+**问题**: 麦克风说话后服务端无响应。
+
+**根因**: `parseFunASRResponse` 对 FunASR 的周期性 decode 响应（空 sentences + 空 partial）判定为错误，导致 readLoop goroutine 退出。后续 SEGMENT_END 响应中的实际 sentence 无人读取。
+
+**修复** (`internal/voice/funasr_asr.go`): 移除了过于严格的验证检查。空响应是 FunASR 定时 decode 的正常行为，不应视为错误。
+
+---
+
+### 2. TTS 重复循环修复 (turnActive 机制)
+
+**问题**: LLM 回答后 TTS 重复播放，ASR 产生幻觉文本。
+
+**根因**: LLM+TTS 处理期间，麦克风音频继续流入 FunASR → FunASR 的 `_force_speech_on_next_audio` 机制将噪声标记为语音 → Silero VAD 检测到 VADEnd → 触发 SEGMENT_END → FunASR 从噪声中幻觉出文本 → 触发新一轮 LLM+TTS → 无限循环。
+
+**修复**:
+- 服务端 (`internal/voice/session.go`): 新增 `turnActive atomic.Bool` 字段。`ProcessAudio` 在 `turnActive=true` 时跳过 SEGMENT_END 发送。
+- 客户端 (`client/voice_client.py`): `player.playing` flag 控制 TTS 播放期间不发送麦克风数据。
+
+```go
+// session.go - consumeServerEndpointingTranscripts
+s.turnActive.Store(true)
+_, err := s.runTextTurn(s.ctx, transcript)
+s.turnActive.Store(false)
+
+// session.go - ProcessAudio (endpointing 模式)
+if s.turnActive.Load() {
+    return VoiceTurnOutput{Final: false}, nil
+}
+```
+
+---
+
+### 3. LLM 中文指令
+
+**问题**: LLM 用英文回复。
+
+**修复** (`internal/config/config.go`): 默认 instruction 改为中文:
+
+```go
+Instruction: envString("AGENT_INSTRUCTION", "你是一个实时语音助手。请用自然、简洁的中文回答，适合语音朗读，不要使用 Markdown 格式。"),
+```
+
+---
+
+### 4. ASR final 事件时序修复
+
+**问题**: 客户端日志中 `[ASR final]` 出现在 `[TTS end]` 之后，影响 UI 展示。
+
+**根因**: `consumeServerEndpointingTranscripts` 在 `runTextTurn` 完成后才发送 `sentence` 输出。
+
+**修复** (`internal/voice/session.go`): 在调用 `runTextTurn` 之前就发送 `sentence` 输出:
+
+```go
+s.outputs <- VoiceTurnOutput{Type: "sentence", Transcript: transcript}
+s.turnActive.Store(true)
+_, err := s.runTextTurn(s.ctx, transcript)
+s.turnActive.Store(false)
+```
+
+---
+
+### 5. LLM Off-by-one 响应修复 (核心 bug)
+
+**问题**: LLM 始终回答上一个问题而不是当前问题。Q1 正确，Q2 回答 Q1 的内容，Q3 回答 Q2 的内容，以此类推。
+
+**根因**: `internal/sessionstore/managed.go` 的 `AppendEvent` 方法。
+
+ADK runner 流程:
+1. `ManagedService.Get()` 返回 session 副本 A → 传给 InvocationContext
+2. `ManagedService.AppendEvent(sess=A, userEvent)` 内部重新调用 `s.inner.Get()` 获取**新副本 B** → event 追加到 B
+3. LLM 读取 `ictx.Session().Events()` (仍是副本 A) → **看不到当前 user message**
+4. LLM 只能看到上一轮及之前的历史 → 回答上一个问题
+
+**修复** (`internal/sessionstore/managed.go`): 直接将 event 追加到调用者传入的 session 对象，不再重新获取副本:
+
+```go
+func (s *ManagedService) AppendEvent(ctx context.Context, sess adksession.Session, event *adksession.Event) error {
+    if sess == nil {
+        return fmt.Errorf("sessionstore: session is nil")
+    }
+    if event == nil {
+        return fmt.Errorf("sessionstore: event is nil")
+    }
+    // 解包 sessionView，确保内层 service 收到可修改的具体 *session
+    target := sess
+    if sv, ok := sess.(sessionView); ok {
+        target = sv.inner
+    }
+    if err := s.inner.AppendEvent(ctx, target, event); err != nil {
+        return err
+    }
+    s.record(target)
+    return nil
+}
+```
+
+这确保 `inMemoryService.AppendEvent` 的 `sess.appendEvent(event)` 修改的是 runner 持有的同一个 session 对象，LLM 构建 prompt 时能看到包含当前 user message 的完整历史。
+
+**测试**: `go test ./internal/sessionstore/... -v` 全部通过。
+
+---
+
+### 6. 客户端改动
+
+改动文件: `client/voice_client.py`
+
+- `SERVER_URL` → `ws://192.168.2.99:8080/v1/chat/voice` (支持远程客户端)
+- 新增 `SESSION_ID = "test-session-1"` 并拼入 URL (多轮对话)
+- `TTSPlayer.playing` flag + `send_mic_audio` 跳过播放期间的音频发送
+
+---
+
+### 当前状态 (E2E 验证通过)
+
+| 组件 | 状态 |
+|------|------|
+| Silero VAD → SEGMENT_END | ✅ 正常断句 |
+| FunASR readLoop | ✅ 修复后稳定 |
+| LLM 多轮上下文 | ✅ off-by-one 修复后正确 |
+| turnActive 防幻觉 | ✅ LLM+TTS 期间不触发 SEGMENT_END |
+| 客户端静音 | ✅ TTS 播放期间不发音频 |
+| 中文对话 | ✅ 正常回答 |
+| 会话记忆 (in-memory) | ✅ 同 session_id 多轮对话正确 |
+
+---
+
+### 已知限制
+
+1. **内存 session 无持久化** — 服务重启后丢失所有对话历史。需配置 `ADK_SESSION_POSTGRES_DSN` 启用持久化。
+2. **session 无上限** — `Config{}` 未设 `MaxTurns`/`MaxEvents`，长对话可能导致 LLM token 超限。
+3. **Barge-in 未实现** — 用户开口说话时不会中断正在播放的 TTS。
+4. **mem0 记忆未注入** — 长期记忆查询已实现但结果未合并到 LLM prompt。
+
+### 下一步
+
+1. 给 `Config` 设 `MaxTurns` 限制上下文窗口
+2. 实现 barge-in (新语音取消当前 TTS turn)
+3. 接入 mem0 记忆注入到 LLM prompt
+4. 配置 PostgreSQL 做 session 持久化
