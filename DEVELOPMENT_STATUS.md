@@ -1282,8 +1282,131 @@ psql "postgresql://mem0:<strong-password>@127.0.0.1:5432/mem0" \
 
 ### 后续步骤
 
-1. 安装 PostgreSQL 16 与 pgvector，创建 `mem0` 数据库和受限用户。
-2. 修改 `/data/liuxin/mem0/server` 以启用 `FastEmbed`，并配置本地多语言 embedding 模型。
-3. 配置 mem0 的记忆提炼 LLM、认证和 PostgreSQL 连接；本地开发可用 `AUTH_DISABLED=true`，生产环境必须启用 API key/JWT。
-4. 启动 mem0 API 到 `localhost:8888`，验证 `/docs`、`/search`、`/memories`。
+1. ~~安装 PostgreSQL 16 与 pgvector，创建 `mem0` 数据库和受限用户。~~ ✅
+2. ~~修改 `/data/liuxin/mem0/server` 以启用 `FastEmbed`，并配置本地多语言 embedding 模型。~~ ✅
+3. ~~配置 mem0 的记忆提炼 LLM、认证和 PostgreSQL 连接；本地开发可用 `AUTH_DISABLED=true`，生产环境必须启用 API key/JWT。~~ ✅
+4. ~~启动 mem0 API 到 `localhost:8888`，验证 `/docs`、`/search`、`/memories`。~~ ✅
 5. 用真实多轮语音验证：写入成功、随后查询命中、`[记忆上下文]` 注入 LLM；补充 mem0 HTTP 集成测试和安全的结构化召回日志。
+
+---
+
+## Development Log: mem0 本地服务部署完成 (2026-07-14)
+
+### 概要
+
+mem0 服务已在本机 `localhost:8888` 成功运行，POST `/memories` 写入和 POST `/search` 检索均验证通过。
+
+### 基础设施
+
+| 组件 | 配置 |
+|------|------|
+| PostgreSQL | 16, 本机 `127.0.0.1:5432` |
+| 数据库 | `mem0` (向量存储) + `mem0_app` (应用表/alembic) |
+| 用户 | `mem0` / `mem0pass` |
+| pgvector 扩展 | 已安装（从 `/data/liuxin/pgvector/` 编译） |
+| Python 环境 | `/data/liuxin/mem0/.venv` (venv) |
+| LLM | 豆包 `doubao-seed-2-0-mini-260428` via OpenAI-compatible API |
+| Embedder | FastEmbed `thenlper/gte-large` (1024 dims, 本地 ONNX) |
+| 模型缓存 | `/data/liuxin/fastembed_models` (通过 `HF_ENDPOINT=https://hf-mirror.com` 下载) |
+
+### mem0 源码改动 (`/data/liuxin/mem0`)
+
+#### 1. `server/main.py` — 服务配置
+
+- `BUNDLED_EMBEDDER_PROVIDERS` 增加 `"fastembed"`
+- `DEFAULT_CONFIG` 改为动态构建：支持 `OPENAI_BASE_URL` 和 fastembed provider
+- `vector_store.config` 增加 `"embedding_model_dims": 1024`（默认 1536 是 OpenAI embedding 维度，gte-large 输出 1024 维）
+
+#### 2. `mem0/vector_stores/pgvector.py` — psycopg3 向量类型适配
+
+**问题**: FastEmbed 返回 numpy ndarray，psycopg3 不知道如何将 ndarray 序列化为 pgvector 的 `vector` 类型，报错：
+```
+psycopg.ProgrammingError: cannot adapt type 'ndarray' using placeholder '%s' (format: AUTO)
+```
+
+**修复**: 在 `_get_cursor` 的 psycopg3 分支中注册 pgvector 适配器：
+
+```python
+if PSYCOPG_VERSION == 3:
+    from pgvector.psycopg import register_vector
+    with self.connection_pool.connection() as conn:
+        register_vector(conn)
+        with conn.cursor() as cur:
+            ...
+```
+
+需要额外安装 `pgvector` Python 包：`pip install pgvector`
+
+#### 3. `server/.env` — 环境变量配置文件（新建）
+
+包含 LLM、Embedder、Postgres、Auth、History、Telemetry 全部配置。`AUTH_DISABLED=true` 用于本地开发。
+
+### 启动命令
+
+```bash
+cd /data/liuxin/mem0/server
+source /data/liuxin/mem0/.venv/bin/activate
+set -a && source .env && set +a
+export HF_ENDPOINT=https://hf-mirror.com
+uvicorn main:app --host 0.0.0.0 --port 8888
+```
+
+### 验证结果
+
+```bash
+# 写入
+curl -X POST http://127.0.0.1:8888/memories \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "我叫小鱼，我最近工作压力很大"}], "user_id": "test-user-1"}'
+# → {"results":[{"id":"...","memory":"User's name is Xiaoyu...","event":"ADD"}]}
+
+# 检索
+curl -X POST http://127.0.0.1:8888/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "用户叫什么名字", "user_id": "test-user-1"}'
+# → {"results":[{"memory":"User's name is Xiaoyu...","score":0.83...}]}
+```
+
+### 注意事项
+
+- mem0 源码改动未提交到 mem0 仓库，仅本地生效。`pip install --upgrade mem0ai` 会覆盖 `pgvector.py` 的修复。
+- pgvector 适配器 bug 是 mem0 在 psycopg3 + fastembed 组合下的已知缺陷，未来版本可能修复。
+- `embedding_model_dims` 必须与所选 embedding 模型输出维度一致，否则 INSERT 会报 `expected N dimensions, not M`。
+- alembic 迁移需要先 source `.env` 再执行：`cd /data/liuxin/mem0/server && alembic upgrade head`
+
+### 当前状态
+
+| 组件 | 状态 |
+|------|------|
+| mem0 服务 | ✅ 运行中 (localhost:8888) |
+| 记忆写入 | ✅ POST /memories 成功 |
+| 记忆检索 | ✅ POST /search 成功 (score 0.83) |
+| Go 服务 mem0 集成 | ✅ BeforeModelCallback + MemoryWriter 已提交 |
+| E2E 语音+记忆 | ✅ 已验证（见下方） |
+
+### E2E 记忆验证结果
+
+验证流程（排除 session 记忆干扰）：
+
+1. 用 Python 客户端 (user_id=test-user, session-A) 说"叫我 Trump" → mem0 写入成功
+2. 重启 Go 服务（清空 in-memory session store）
+3. 用新 session 问"你还记得我叫什么吗" → LLM 回答包含用户名
+
+确认 BeforeModelCallback 从 mem0 检索记忆并注入 LLM prompt 生效。
+
+### 记忆架构决策
+
+**多语言策略**: mem0 默认用英文存储提炼后的记忆（如 "User's name is Xiaoyu"）。对于中/日/英多语言用户场景，英文作为记忆的"中间语言"是合理方案：
+- `thenlper/gte-large` 是多语言 embedding 模型，跨语言检索能命中（中文 query 匹配英文记忆 score 0.83）
+- 不需要按语种维护多套 custom_instructions
+- LLM 根据当前对话语言自适应回复
+
+**Session Store vs mem0 分工**:
+- Session Store (in-memory): 当前对话上下文，支持指代、追问、话题延续
+- mem0: 跨会话长期记忆，存提炼后的事实/偏好
+- 两者不可互相替代——去掉 session store 会丢失当前对话连贯性
+
+**Session Store 待优化**:
+- 当前 `sessionstore.Config{}` 为空，无 TTL/MaxTurns 限制，session 永不释放
+- 语音场景建议：WebSocket 关闭时直接删除对应 session，不依赖 TTL 定时清理
+- 可选加 `MaxTurns: 20` 防止单次超长对话撑爆 LLM token 窗口
