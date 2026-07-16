@@ -23,18 +23,31 @@ type VADFactory func() (vad.AudioProcessor, error)
 
 type ASRFactory func(ctx context.Context) (voice.StreamingASR, error)
 
+type SessionCloseFunc func(ctx context.Context, userID, sessionID string)
+
 type Server struct {
-	httpServer *http.Server
-	pipeline   *voice.Pipeline
-	logger     *slog.Logger
-	upgrader   websocket.Upgrader
-	vadFactory VADFactory
-	asrFactory ASRFactory
-	ttsFactory voice.TTSFactory
-	sampleRate int
+	httpServer     *http.Server
+	pipeline       *voice.Pipeline
+	logger         *slog.Logger
+	upgrader       websocket.Upgrader
+	vadFactory     VADFactory
+	asrFactory     ASRFactory
+	ttsFactory     voice.TTSFactory
+	sampleRate     int
+	onSessionClose SessionCloseFunc
 }
 
-func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger, vadFactory VADFactory, asrFactory ASRFactory, ttsFactories ...voice.TTSFactory) *Server {
+type ServerOption func(*Server)
+
+func WithSessionClose(fn SessionCloseFunc) ServerOption {
+	return func(s *Server) { s.onSessionClose = fn }
+}
+
+func WithTTSFactory(f voice.TTSFactory) ServerOption {
+	return func(s *Server) { s.ttsFactory = f }
+}
+
+func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger, vadFactory VADFactory, asrFactory ASRFactory, opts ...ServerOption) *Server {
 	if cfg.SampleRate == 0 {
 		cfg.SampleRate = vad.DefaultSampleRate
 	}
@@ -46,8 +59,8 @@ func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger, vadFac
 		asrFactory: asrFactory,
 		sampleRate: cfg.SampleRate,
 	}
-	if len(ttsFactories) > 0 {
-		server.ttsFactory = ttsFactories[0]
+	for _, opt := range opts {
+		opt(server)
 	}
 
 	mux := http.NewServeMux()
@@ -191,7 +204,10 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 	for {
 		messageType, payload, err := conn.ReadMessage()
 		if err != nil {
-			s.logger.Info("voice websocket closed", "user_id", userID, "error", err)
+			s.logger.Info("voice websocket closed", "user_id", userID, "session_id", sessionID, "error", err)
+			if s.onSessionClose != nil {
+				s.onSessionClose(r.Context(), userID, sessionID)
+			}
 			return
 		}
 		switch messageType {

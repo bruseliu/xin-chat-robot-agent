@@ -102,7 +102,18 @@ func main() {
 		func(ctx context.Context) (voice.StreamingASR, error) {
 			return newASRStream(ctx, cfg.ASR, logger)
 		},
-		ttsFactory,
+		api.WithTTSFactory(ttsFactory),
+		api.WithSessionClose(func(ctx context.Context, userID, sessionID string) {
+			if err := sessionService.Delete(ctx, &adksession.DeleteRequest{
+				AppName:   cfg.AgentID,
+				UserID:    userID,
+				SessionID: sessionID,
+			}); err != nil {
+				logger.Warn("delete session on ws close failed", "user_id", userID, "session_id", sessionID, "error", err)
+			} else {
+				logger.Info("session deleted on ws close", "user_id", userID, "session_id", sessionID)
+			}
+		}),
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

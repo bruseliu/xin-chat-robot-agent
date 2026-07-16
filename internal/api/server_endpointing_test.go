@@ -64,7 +64,7 @@ func TestVoiceWebSocketWritesTTSAudioAsBinaryFrame(t *testing.T) {
 			return &apiFakeVAD{out: vad.AudioOutput{Chunk: vad.Chunk{PCM16LE: []byte{1, 0}, SampleRate: 16000}}}, nil
 		},
 		func(context.Context) (voice.StreamingASR, error) { return asr, nil },
-		func(context.Context) (tts.Stream, error) { return newAPIFakeTTS(), nil },
+		WithTTSFactory(func(context.Context) (tts.Stream, error) { return newAPIFakeTTS(), nil }),
 	)
 	httpServer := httptest.NewServer(server.httpServer.Handler)
 	defer httpServer.Close()
