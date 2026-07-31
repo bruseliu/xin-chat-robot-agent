@@ -19,10 +19,13 @@ import (
 const defaultDoubaoBaseURL = "https://ark.cn-beijing.volces.com/api/v3"
 
 type DoubaoConfig struct {
-	BaseURL    string
-	APIKey     string
-	Model      string
-	Timeout    time.Duration
+	BaseURL string
+	APIKey  string
+	Model   string
+	Timeout time.Duration
+	// Thinking sets the reasoning mode for thinking-capable models
+	// ("disabled" or "enabled"). Empty means leave it to the provider default.
+	Thinking   string
 	HTTPClient *http.Client
 }
 
@@ -136,6 +139,9 @@ func (m *DoubaoLLM) newChatRequest(req *model.LLMRequest, stream bool) (doubaoCh
 	if req.Config != nil {
 		out.MaxTokens = req.Config.MaxOutputTokens
 	}
+	if t := strings.TrimSpace(m.cfg.Thinking); t != "" {
+		out.Thinking = &doubaoThinking{Type: t}
+	}
 	return out, nil
 }
 
@@ -246,6 +252,15 @@ type doubaoChatRequest struct {
 	Messages  []doubaoMessage `json:"messages"`
 	Stream    bool            `json:"stream"`
 	MaxTokens int32           `json:"max_tokens,omitempty"`
+	Thinking  *doubaoThinking `json:"thinking,omitempty"`
+}
+
+// doubaoThinking controls reasoning models such as doubao-seed-2-0-mini.
+// Type is "disabled" or "enabled". Reasoning tokens are emitted before any
+// answer content, so leaving it enabled adds seconds to first-token latency —
+// unacceptable for realtime voice.
+type doubaoThinking struct {
+	Type string `json:"type"`
 }
 
 type doubaoMessage struct {

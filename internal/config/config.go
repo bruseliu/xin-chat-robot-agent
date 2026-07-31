@@ -24,22 +24,24 @@ type SessionConfig struct {
 }
 
 type Mem0Config struct {
-	Mode    string
-	BaseURL string
-	APIKey  string
-	TopK    int
-	Timeout time.Duration
+	Mode         string
+	BaseURL      string
+	APIKey       string
+	TopK         int
+	Timeout      time.Duration
+	WriteTimeout time.Duration
 }
 
 type LLMConfig struct {
-	Provider      string
-	GeminiAPIKey  string
-	GeminiModel   string
-	DoubaoBaseURL string
-	DoubaoAPIKey  string
-	DoubaoModel   string
-	DoubaoTimeout time.Duration
-	Instruction   string
+	Provider       string
+	GeminiAPIKey   string
+	GeminiModel    string
+	DoubaoBaseURL  string
+	DoubaoAPIKey   string
+	DoubaoModel    string
+	DoubaoTimeout  time.Duration
+	DoubaoThinking string
+	Instruction    string
 }
 
 type TTSConfig struct {
@@ -107,6 +109,9 @@ func Load() Config {
 			APIKey:  envString("MEM0_API_KEY", ""),
 			TopK:    envInt("MEM0_TOP_K", 8),
 			Timeout: time.Duration(envInt("MEM0_TIMEOUT_SECONDS", 10)) * time.Second,
+			// Writes are asynchronous; mem0 spends seconds of LLM time per write
+			// reconciling facts against the existing store, so allow much longer.
+			WriteTimeout: time.Duration(envInt("MEM0_WRITE_TIMEOUT_SECONDS", 60)) * time.Second,
 		},
 		LLM: LLMConfig{
 			Provider:      envString("LLM_PROVIDER", "none"),
@@ -116,7 +121,10 @@ func Load() Config {
 			DoubaoAPIKey:  envString("DOUBAO_LLM_API_KEY", envString("ARK_API_KEY", "")),
 			DoubaoModel:   envString("DOUBAO_LLM_MODEL", ""),
 			DoubaoTimeout: time.Duration(envInt("DOUBAO_LLM_TIMEOUT_SECONDS", 60)) * time.Second,
-			Instruction:   envString("AGENT_INSTRUCTION", "你是一个实时语音助手。请用自然、简洁的中文回答，适合语音朗读，不要使用 Markdown 格式。"),
+			// Reasoning models emit thinking tokens before any answer content,
+			// costing seconds of first-token latency. Voice needs it off.
+			DoubaoThinking: envString("DOUBAO_LLM_THINKING", "disabled"),
+			Instruction:    envString("AGENT_INSTRUCTION", "你是一个实时语音助手。请用自然、简洁的中文回答，适合语音朗读，不要使用 Markdown 格式。"),
 		},
 		VAD: VADConfig{
 			Provider:             envString("VAD_PROVIDER", "none"),

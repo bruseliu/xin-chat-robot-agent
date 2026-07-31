@@ -176,3 +176,49 @@ func TestManagedServiceDeleteExpired(t *testing.T) {
 		t.Fatal("Stats() still has expired session")
 	}
 }
+
+// The ADK runner does Get() -> AppendEvent(userEvent) -> read Session().Events()
+// while building the model request. A windowed session must therefore reflect
+// events appended after Get(); otherwise the current user message is invisible
+// to the model and ADK substitutes a synthetic continuation prompt for it.
+func TestManagedServiceWindowedSessionSeesLaterAppends(t *testing.T) {
+	ctx := context.Background()
+	svc, err := NewInMemoryManagedService(Config{MaxTurns: 3})
+	if err != nil {
+		t.Fatalf("NewInMemoryManagedService() error = %v", err)
+	}
+	created, err := svc.Create(ctx, &adksession.CreateRequest{
+		AppName:   "app",
+		UserID:    "user",
+		SessionID: "live",
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	for _, author := range []string{"user", "agent"} {
+		if err := svc.AppendEvent(ctx, created.Session, &adksession.Event{Author: author}); err != nil {
+			t.Fatalf("AppendEvent(%s) error = %v", author, err)
+		}
+	}
+
+	got, err := svc.Get(ctx, &adksession.GetRequest{AppName: "app", UserID: "user", SessionID: "live"})
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if n := got.Session.Events().Len(); n != 2 {
+		t.Fatalf("Events().Len() before append = %d, want 2", n)
+	}
+
+	// Simulate the runner appending the current turn's user message.
+	if err := svc.AppendEvent(ctx, got.Session, &adksession.Event{Author: "user"}); err != nil {
+		t.Fatalf("AppendEvent(user) error = %v", err)
+	}
+
+	events := got.Session.Events()
+	if n := events.Len(); n != 3 {
+		t.Fatalf("Events().Len() after append = %d, want 3", n)
+	}
+	if last := events.At(events.Len() - 1); last == nil || last.Author != "user" {
+		t.Fatalf("last event author = %v, want \"user\"", last)
+	}
+}

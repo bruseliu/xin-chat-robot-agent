@@ -149,6 +149,56 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("voice websocket connected", "user_id", userID, "session_id", sessionID, "sample_rate", sampleRate, "remote_addr", r.RemoteAddr)
 
+	// Write pump: serializes all writes through one goroutine.
+	// Pong has a dedicated channel with priority over data frames.
+	type wsMsg struct {
+		msgType int
+		data    []byte
+	}
+	writeCh := make(chan wsMsg, 256)
+	pongCh := make(chan wsMsg, 4)
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		for {
+			// Drain pong with priority
+			select {
+			case msg := <-pongCh:
+				if msg.msgType == 0 {
+					continue
+				}
+				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
+					return
+				}
+				continue
+			default:
+			}
+			select {
+			case msg := <-pongCh:
+				if msg.msgType == 0 {
+					continue
+				}
+				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
+					return
+				}
+			case msg, ok := <-writeCh:
+				if !ok {
+					return
+				}
+				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	conn.SetPingHandler(func(appData string) error {
+		select {
+		case pongCh <- wsMsg{msgType: websocket.PongMessage, data: []byte(appData)}:
+		default:
+		}
+		return nil
+	})
+
 	closeSession := func() {}
 
 	processor, err := s.vadFactory()
@@ -180,13 +230,19 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			defer close(writerDone)
 			for output := range outputs {
-				var err error
+				var msg wsMsg
 				if len(output.AudioPCM) > 0 {
-					err = conn.WriteMessage(websocket.BinaryMessage, output.AudioPCM)
+					msg = wsMsg{msgType: websocket.BinaryMessage, data: output.AudioPCM}
 				} else {
-					err = conn.WriteJSON(output)
+					data, err := json.Marshal(output)
+					if err != nil {
+						return
+					}
+					msg = wsMsg{msgType: websocket.TextMessage, data: data}
 				}
-				if err != nil {
+				select {
+				case writeCh <- msg:
+				case <-writeDone:
 					return
 				}
 			}
@@ -197,6 +253,13 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 		if writerDone != nil {
 			<-writerDone
 			writerDone = nil
+		}
+		select {
+		case <-writeDone:
+		default:
+			close(writeCh)
+			close(pongCh)
+			<-writeDone
 		}
 	}
 	defer closeSession()

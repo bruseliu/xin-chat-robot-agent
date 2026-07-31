@@ -1410,3 +1410,265 @@ curl -X POST http://127.0.0.1:8888/search \
 - 当前 `sessionstore.Config{}` 为空，无 TTL/MaxTurns 限制，session 永不释放
 - 语音场景建议：WebSocket 关闭时直接删除对应 session，不依赖 TTL 定时清理
 - 可选加 `MaxTurns: 20` 防止单次超长对话撑爆 LLM token 窗口
+
+---
+
+## Development Log: WebSocket Write Pump + TTS 播放修复 (2026-07-23)
+
+### 问题与修复
+
+#### 1. WebSocket Ping Timeout 断连（长 TTS 场景）
+
+**问题**: 背诵长文本（如出师表）时，TTS 音频播放到一半 WebSocket 连接断开，客户端报 `keepalive ping timeout`。
+
+**根因分析**:
+1. TTS 产出音频速度 > 客户端实时播放速度（client `stream.write()` blocking）
+2. 客户端读 WebSocket 被播放速率限制 → TCP 背压 → 服务端 `WriteMessage` 阻塞
+3. gorilla/websocket 的默认 ping handler 在 `ReadMessage` 内部触发，通过 `WriteControl` 回 pong
+4. `WriteControl` 需要获取写锁（`c.mu`），但写锁被 data frame 持续占用
+5. pong 回复超过 1s deadline → 客户端 ping timeout → 断连
+
+**修复** (`internal/api/server.go`):
+- 引入 **write pump** 模式：所有 WebSocket 写操作通过一个 goroutine 序列化
+- 分离 `pongCh`（容量 4，高优先级）和 `writeCh`（容量 256，数据帧）
+- write pump 每次循环优先检查 pongCh，确保 pong 不被大量 audio frame 阻塞
+- 自定义 `SetPingHandler`，将 pong 发送到 pongCh 而非走默认的 `WriteControl`
+
+```go
+// Write pump with pong priority
+go func() {
+    for {
+        select {
+        case msg := <-pongCh:  // priority
+            conn.WriteMessage(msg.msgType, msg.data)
+        default:
+        }
+        select {
+        case msg := <-pongCh:
+            conn.WriteMessage(msg.msgType, msg.data)
+        case msg, ok := <-writeCh:
+            if !ok { return }
+            conn.WriteMessage(msg.msgType, msg.data)
+        }
+    }
+}()
+```
+
+这是 gorilla/websocket 官方推荐的 write pump 模式——`Conn` 写操作不是并发安全的，所有写入必须由同一个 goroutine 执行。
+
+#### 2. 客户端 TTS 播放阻塞 WebSocket 读取
+
+**问题**: 客户端 `player.feed(pcm)` 调用 pyaudio `stream.write()` 是阻塞的（按实时播放速率），导致 `recv_messages` 中 `async for message in ws` 读取速度被限制。
+
+**修复** (`client/voice_client.py`):
+- `TTSPlayer` 改为独立线程播放，`feed()` 非阻塞入队
+- 分离 `flush()`（等播完）和 `stop()`（立即打断/barge-in）
+- `flush()` 在 `tts_end` 时通过 `run_in_executor` 调用，不阻塞 asyncio 事件循环
+
+```python
+class TTSPlayer:
+    def feed(self, pcm):    # 非阻塞：入队
+    def flush(self):        # 阻塞：等队列播完 + 写静音 flush 硬件缓冲区
+    def stop(self):         # 立即中断（barge-in）
+```
+
+#### 3. TTS 播放尾部截断
+
+**问题**: pyaudio `stream.write()` 返回只代表数据进入了硬件缓冲区，`stop_stream()` 会截断未播完的音频。
+
+**修复**: 播放线程 drain 完队列后写 300ms 静音，确保硬件缓冲区中的真实音频播完后再关流。
+
+#### 4. TTS 播放期间堆积用户音频
+
+**问题**: `player.flush()` 同步阻塞 asyncio 事件循环 → `send_mic_audio` 任务暂停 → PyAudio 输入缓冲区堆积 → flush 结束后堆积音频被发送 → 服务端回答 TTS 期间的提问。
+
+**修复**: `tts_end` 处理改为 `await asyncio.get_event_loop().run_in_executor(None, player.flush)`，事件循环不被阻塞，`send_mic_audio` 持续读取并丢弃麦克风数据（`player.playing=True` 期间不发送）。
+
+### 其他改动
+
+- **LLM 请求上下文日志**: `cmd/server/llm_gemini.go` 中 BeforeModelCallback 异步打印完整 LLM 请求内容（role + text），用于诊断 TTFT 延迟
+- **客户端 ping 参数**: `ping_interval=30, ping_timeout=60`（加大容忍度作为额外保险）
+- **mem0 custom_instructions**: 配置只提取用户事实，不存助手回复，按用户语言存储
+
+### 当前已知问题
+
+| 问题 | 状态 | 备注 |
+|------|------|------|
+| LLM 首 token ~10s | ✅ 已解决 (2026-07-31) | 思考模型的 reasoning 阶段，见下节 |
+| mem0 写入超时 | ✅ 已解决 (2026-07-31) | search/add 共用 10s client 超时，见下节 |
+| Barge-in | ❌ 未实现 | TTS 期间客户端不发音频，无法打断 |
+| Echo/回声 | ⚠️ 已知 | 需要 AEC，开发阶段用耳机 |
+
+---
+
+## Development Log: 首 token 延迟 / session 窗口回归 / 记忆质量 (2026-07-31)
+
+本轮共修复 4 个问题。第 2 个是本轮自己引入的回归，第 3、4 个是记忆质量的两次反向调整，记录在此以免重犯。
+
+### 1. LLM 首 token 延迟 7–12s — 思考模型的 reasoning 阶段
+
+**现象**: 第二轮对话开始首 token 明显变慢，复杂问题更严重。
+
+**排查过程**（先排除了两个常见嫌疑）:
+
+| 测试 | 结果 |
+|------|------|
+| mem0 search 基线 | 90ms |
+| mem0 写入在飞时的 search / LLM TTFT | 无影响（100ms / 400ms），**排除资源竞争** |
+| doubao TTFT vs 上下文长度（0→20 轮，181→3243 字符） | 全部 0.4s，**排除上下文长度** |
+
+**根因**: `doubao-seed-2-0-mini-260428` 是**思考模型**。首包 SSE 里 `content` 为空，装的是 `reasoning_content`：
+
+```json
+{"delta":{"content":"","reasoning_content":"用户","role":"assistant"}}
+```
+
+适配器只取 `content`，所以要等 reasoning 全部吐完才有第一个可送 TTS 的字。TTFT ≈ 思考字数 ÷ 100 字/秒：
+
+| 提问 | 首包 SSE | 首个 content | 思考字数 |
+|---|---|---|---|
+| 你好 | 0.38s | 1.29s | 94 |
+| 你还记得我吗？ | 0.58s | 2.57s | 153 |
+| 跟我聊聊天儿 | 0.34s | 2.85s | 202 |
+| 背诵完整的出师表 | 0.41s | **12.24s** | 1260 |
+
+这解释了"第二轮开始变慢"：第一轮多是短招呼（思考 94 字），第二轮起是开放式提问（200+ 字）。
+
+**修复**: 加 `thinking` 请求参数，默认 `disabled`
+
+- `internal/llm/doubao.go` — `doubaoChatRequest` 加 `Thinking *doubaoThinking`，`DoubaoConfig` 加 `Thinking string`
+- `internal/config/config.go` — `DOUBAO_LLM_THINKING`，默认 `disabled`
+- `cmd/server/llm_gemini.go` — 透传
+- `.env` / `.env.example` — 显式声明
+
+| 提问 | 开思考 | 关思考 |
+|---|---|---|
+| 你还记得我吗？ | 3.47s | **0.48s** |
+| 跟我聊聊天儿 | 3.05s | **0.42s** |
+| 背诵完整的出师表 | 12.72s | **0.67s** |
+
+实测服务端 `agent turn` → `tts started` 从 7s 降到 **0.57s**。
+
+> 若将来换回思考模型或需要 reasoning，应把 `reasoning_content` 也作为独立事件类型透出（用于 UI 展示"正在思考"），而不是让它阻塞 TTS。
+
+### 2. 回归: MaxTurns 窗口导致当前发言不可见（本轮引入）
+
+**现象**: 第二轮起 LLM 用英文回复，且答非所问（"It seems there is no new request here"），无视"说中文"。
+
+**排查**: 一开始查不下去，因为存在**日志盲区**——请求日志被放在 `len(memories)==0` 的提前返回之后，记忆为空的轮次完全没有记录。补上日志后立刻定位（见改动 5）：
+
+```
+[0] user: 你好，你好。
+[1] model: 你好呀！有什么我能帮上忙的吗？
+[2] user: Continue processing previous requests as instructed. Exit or provide a summary if no more outputs are needed.
+```
+
+用户当前发言"你还记得我是谁吗？"根本没进 `req.Contents`，要到下一轮才从 session 历史冒出来。ADK 检测到历史以 model 轮结尾（Gemini 要求 role 交替），补了一句合成 user 消息占位（`internal/llminternal/contents_processor.go:68`）。模型看到最后一句是英文指令，就照着回英文。
+
+**根因**: `internal/sessionstore/managed.go` 的 `sessionView` 存的是 `Get()` 时刻的事件**快照**。ADK runner 的顺序是：
+
+```
+Get() → AppendEvent(用户发言) → 读 Session().Events() 构造请求
+```
+
+AppendEvent 落到 inner session，但 view 的快照不更新，当前发言因此不可见。
+
+这是 `MaxTurns: 3` 触发的——`MaxTurns=0` 时 `windowSession` 直接返回原 session、不套 view，所以之前一直没暴露。**与 2026-07-13 修过的 off-by-one 同源，是它的另一个入口。**
+
+**修复**: `sessionView` 不再存快照，改存 `maxTurns`，`Events()` 每次对 inner 的实时事件做惰性窗口：
+
+```go
+func (s sessionView) Events() adksession.Events {
+	return eventList(keepLastTurns(collectEvents(s.inner.Events()), s.maxTurns))
+}
+```
+
+回归测试 `TestManagedServiceWindowedSessionSeesLaterAppends` 覆盖"Get() 之后 append 必须可见"，并验证过改回快照实现即 FAIL。
+
+**副作用**: 修复前 `lastUserText()` 取到的是那句英文样板，拿它去 mem0 检索全部落空——这也是当时记忆一直搜不到的原因之一。
+
+### 3. 记忆注入位置: contents → system instruction
+
+**现象**: 模型主动执行记忆里的内容，反复背《出师表》。
+
+**根因**: 记忆以 `user` role 插在 contents 最前面，模型天然当成"用户说过的话"。加一句"这不是当前请求"的免责声明压不住。
+
+**修复** (`cmd/server/llm_gemini.go`): 改为拼进 `req.Config.SystemInstruction`，即指令层，与业界（ChatGPT memory）一致。构造新的 `Content` 对象而非 append 到原 Parts，避免污染 agent 配置里跨轮共享的 SystemInstruction。
+
+> 注意 ADK 会在 system instruction **最前面**插入英文身份样板（`identity_request_processor.go:39`）：`You are an agent. Your internal name is "voice-agent"...`。单独测试它不足以导致英文回复，但 `llmagent.Config.Description` 建议改成中文以减少语言干扰。
+
+### 4. mem0 提取规则的两次调整
+
+**第一次（过滤噪声）**: 库里存了大量一次性指令当长期记忆——`用户请求背诵《出师表》`、`用户让助手停止说话`、`用户请求助理跳舞`、`用户说了"你好，你好"`。加规则排除一次性请求和寒暄。
+
+**第二次（过滤过头，反向修正）**: 数学问题完全没被记住。先排除写入失败——3 次超时发生在 18:35:01/18:35:20/18:40:56，都不在数学轮次（18:38–18:39），说明请求送达了，是 mem0 主动不存。原因是第一次的规则命中了"用户请求解释费马定理"。
+
+这里把两件事混为一谈了：
+
+- **请求本身**（"用户要求背出师表"）—— 一次性，不该存 ✓
+- **请求暴露的兴趣**（"用户对数学感兴趣"）—— 持久事实，该存 ✗ 被一起丢了
+
+**最终规则** (`/data/liuxin/mem0/server/main.py`): 不再笼统禁止请求类记忆，改为明确区分——不要把请求记成待办任务，但要提取它暴露的持久兴趣。带上正反例子：从"解释费马定理"应存"用户对数学感兴趣"而非"用户要求解释费马定理"；若请求不暴露任何持久信息（"唱首歌"、"别说了"）则不存。
+
+> 教训：过滤规则要针对"记成什么形式"，而不是"是否是请求"。请求是信息的载体，不是信息本身。
+
+### 5. mem0 写入超时（记忆静默丢失）
+
+**现象**: `memory write failed: context deadline exceeded`，对应轮次的记忆完全丢失。
+
+**根因**: `MEM0_TIMEOUT_SECONDS=10` 是 `http.Client` 级别的超时，search 和 add 共用。但两者预算需求相反：
+
+- search 在关键路径上，必须快（90ms，超时应立即降级）
+- add 是后台异步的，mem0 内部要多轮 LLM 提炼 + 与已有记忆判重，**耗时随库大小增长**（1 条时 4.5s，20 条时 >30s）
+
+**修复**: 移除 client 级超时，改由各自的 per-request context 控制
+
+| 操作 | 超时 | 环境变量 |
+|---|---|---|
+| Search | 10s | `MEM0_TIMEOUT_SECONDS` |
+| Add | 60s | `MEM0_WRITE_TIMEOUT_SECONDS`（新增） |
+
+`Mem0Client.withTimeout` 只在调用方没有更紧的 deadline 时才施加，不覆盖上游取消。`writer.go` 自己那层 30s 也放宽到 2 分钟，否则会盖住新的 60s。
+
+### 6. 请求日志覆盖所有返回路径
+
+排查问题 2 时发现的日志盲区。`cmd/server/llm_gemini.go` 的请求日志原本在 `len(memories)==0` 提前返回之后，记忆为空时完全无记录。
+
+改为 `defer logLLMRequest(...)`，所有返回路径都记录；新增 `llm system instruction` 日志打印 ADK 拼装后的完整系统提示（此前唯一看不到的部分）；快照文本后再异步输出，避免读到已被模型消费的请求。
+
+### 本轮改动文件
+
+| 文件 | 改动 |
+|------|------|
+| `internal/llm/doubao.go` | `thinking` 请求参数 + `DoubaoConfig.Thinking` |
+| `internal/config/config.go` | `DOUBAO_LLM_THINKING`、`Mem0Config.WriteTimeout` |
+| `internal/sessionstore/managed.go` | `sessionView` 快照 → 惰性窗口（回归修复） |
+| `internal/sessionstore/managed_test.go` | 新增窗口可见性回归测试 |
+| `internal/memory/mem0_client.go` | search/add 分离超时 |
+| `internal/memory/writer.go` | 队列层超时 30s → 2min |
+| `cmd/server/llm_gemini.go` | 记忆注入改到 system instruction；日志覆盖所有路径 |
+| `cmd/server/main.go` | 透传 `WriteTimeout` |
+| `.env` / `.env.example` | `DOUBAO_LLM_THINKING`、`MEM0_WRITE_TIMEOUT_SECONDS` |
+| `/data/liuxin/mem0/server/main.py` | `custom_instructions` 两次调整 |
+
+验证: `go build ./cmd/... ./internal/...` 通过，`go test ./internal/...` 通过。
+
+### 当前状态
+
+| 项 | 状态 |
+|---|---|
+| LLM 首 token | ✅ 0.4–0.7s（关闭 thinking） |
+| 多轮上下文 | ✅ MaxTurns=3 窗口正确，当前发言可见 |
+| 记忆检索 | ✅ E2E 验证（"你喜欢吃西瓜皮蘸酱油"） |
+| 记忆写入 | ✅ 超时已放宽，不再静默丢失 |
+| 记忆提取质量 | ⚠️ 新规则待验证（兴趣类记忆是否正确保留） |
+| Barge-in | ❌ 未实现 |
+| Echo/回声 | ⚠️ 需要 AEC，开发用耳机 |
+
+### 遗留问题
+
+1. **旧记忆数据是旧规则产物** — 新 `custom_instructions` 只对新写入生效，库里既有记忆不会追溯清理。
+2. **mem0 写入耗时随库大小线性增长** — 长期使用需要关注。mem0 每次 add 都要检索相似记忆并让 LLM 逐条判定 ADD/UPDATE/DELETE，记忆上千条后可能需要分片或归档策略。
+3. **`llmagent.Config.Description` 仍是英文** — 会进 system instruction，建议改中文。
+4. **记忆注入无相关性阈值** — 当前固定注入 top 8，不管分数高低。噪声记忆仍可能挤掉有用记忆。
+5. **`scripts/` 目录多个 `package main`** — `go test ./...` 报重复 main 声明（既有问题，非本轮引入）。

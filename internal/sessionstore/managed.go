@@ -139,9 +139,7 @@ func (s *ManagedService) windowSession(sess adksession.Session) adksession.Sessi
 	if sess == nil || s.cfg.MaxTurns <= 0 {
 		return sess
 	}
-	events := collectEvents(sess.Events())
-	windowed := keepLastTurns(events, s.cfg.MaxTurns)
-	return sessionView{inner: sess, events: eventList(windowed)}
+	return sessionView{inner: sess, maxTurns: s.cfg.MaxTurns}
 }
 
 func (s *ManagedService) Stats(appName, userID, sessionID string) (Stats, bool) {
@@ -255,9 +253,17 @@ func isUserEvent(event *adksession.Event) bool {
 	return event.LLMResponse.Content != nil && event.LLMResponse.Content.Role == genai.RoleUser
 }
 
+// sessionView presents a turn-windowed view of an underlying session.
+//
+// The window must be computed lazily on each Events() call rather than snapshot
+// at construction time. The ADK runner does Get() -> AppendEvent(userEvent) ->
+// read Session().Events() when building the model request; a frozen snapshot
+// would omit the just-appended user message, and ADK would then treat the
+// history as ending on a model turn and substitute a synthetic English
+// continuation prompt in place of what the user actually said.
 type sessionView struct {
-	inner  adksession.Session
-	events adksession.Events
+	inner    adksession.Session
+	maxTurns int
 }
 
 func (s sessionView) ID() string {
@@ -277,7 +283,7 @@ func (s sessionView) State() adksession.State {
 }
 
 func (s sessionView) Events() adksession.Events {
-	return s.events
+	return eventList(keepLastTurns(collectEvents(s.inner.Events()), s.maxTurns))
 }
 
 func (s sessionView) LastUpdateTime() time.Time {

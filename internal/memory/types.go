@@ -34,6 +34,8 @@ type AddRequest struct {
 	Messages []Message
 	Metadata map[string]any
 	Infer    *bool
+
+	done chan struct{} // internal: signals flush completion
 }
 
 type Store interface {

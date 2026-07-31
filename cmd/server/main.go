@@ -27,11 +27,12 @@ func main() {
 	}))
 
 	memClient := memory.NewMem0Client(memory.Mem0Config{
-		BaseURL: cfg.Mem0.BaseURL,
-		APIKey:  cfg.Mem0.APIKey,
-		Mode:    cfg.Mem0.Mode,
-		TopK:    cfg.Mem0.TopK,
-		Timeout: cfg.Mem0.Timeout,
+		BaseURL:      cfg.Mem0.BaseURL,
+		APIKey:       cfg.Mem0.APIKey,
+		Mode:         cfg.Mem0.Mode,
+		TopK:         cfg.Mem0.TopK,
+		Timeout:      cfg.Mem0.Timeout,
+		WriteTimeout: cfg.Mem0.WriteTimeout,
 	}, logger)
 
 	var sessionService adksession.Service
@@ -47,7 +48,7 @@ func main() {
 		sessionService = svc
 	} else {
 		logger.Warn("ADK_SESSION_POSTGRES_DSN not set, using in-memory session store")
-		svc, err := sessionstore.NewInMemoryManagedService(sessionstore.Config{})
+		svc, err := sessionstore.NewInMemoryManagedService(sessionstore.Config{MaxTurns: 3})
 		if err != nil {
 			logger.Error("create in-memory session service failed", "error", err)
 			os.Exit(1)
@@ -104,6 +105,7 @@ func main() {
 		},
 		api.WithTTSFactory(ttsFactory),
 		api.WithSessionClose(func(ctx context.Context, userID, sessionID string) {
+			memWriter.Flush(userID)
 			if err := sessionService.Delete(ctx, &adksession.DeleteRequest{
 				AppName:   cfg.AgentID,
 				UserID:    userID,

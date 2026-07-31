@@ -7,4 +7,7 @@ dist/
 tmp/
 coverage.out
 
+# compiled server binary at repo root
+/server
+
 *.log

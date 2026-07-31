@@ -23,16 +23,26 @@ type Mem0Config struct {
 	APIKey  string
 	Mode    string
 	TopK    int
+	// Timeout bounds Search, which sits on the turn's critical path and must
+	// fail fast rather than delay the response.
 	Timeout time.Duration
+	// WriteTimeout bounds Add. Writes run in the background, and mem0 spends
+	// several seconds of LLM time per write extracting facts and reconciling
+	// them against existing memories — a cost that grows with store size. This
+	// is deliberately far more generous than Timeout; too tight a value silently
+	// drops memories.
+	WriteTimeout time.Duration
 }
 
 type Mem0Client struct {
-	baseURL    *url.URL
-	apiKey     string
-	mode       string
-	topK       int
-	httpClient *http.Client
-	logger     *slog.Logger
+	baseURL      *url.URL
+	apiKey       string
+	mode         string
+	topK         int
+	timeout      time.Duration
+	writeTimeout time.Duration
+	httpClient   *http.Client
+	logger       *slog.Logger
 }
 
 func NewMem0Client(cfg Mem0Config, logger *slog.Logger) *Mem0Client {
@@ -48,19 +58,25 @@ func NewMem0Client(cfg Mem0Config, logger *slog.Logger) *Mem0Client {
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
+	writeTimeout := cfg.WriteTimeout
+	if writeTimeout == 0 {
+		writeTimeout = 60 * time.Second
+	}
 	topK := cfg.TopK
 	if topK == 0 {
 		topK = 8
 	}
 	return &Mem0Client{
-		baseURL: baseURL,
-		apiKey:  cfg.APIKey,
-		mode:    mode,
-		topK:    topK,
-		httpClient: &http.Client{
-			Timeout: timeout,
-		},
-		logger: logger,
+		baseURL:      baseURL,
+		apiKey:       cfg.APIKey,
+		mode:         mode,
+		topK:         topK,
+		timeout:      timeout,
+		writeTimeout: writeTimeout,
+		// No client-level timeout: Search and Add need different budgets, so each
+		// applies its own per-request deadline via context.
+		httpClient: &http.Client{},
+		logger:     logger,
 	}
 }
 
@@ -76,11 +92,25 @@ func (c *Mem0Client) Search(ctx context.Context, req SearchRequest) ([]Memory, e
 		"top_k":   topK,
 	}
 
+	ctx, cancel := c.withTimeout(ctx, c.timeout)
+	defer cancel()
+
 	var raw map[string]any
 	if err := c.postJSON(ctx, c.searchPath(), payload, &raw); err != nil {
 		return nil, err
 	}
 	return normalizeMemories(raw), nil
+}
+
+// withTimeout applies d as a deadline unless ctx already has a tighter one.
+func (c *Mem0Client) withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return ctx, func() {}
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= d {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
 }
 
 func (c *Mem0Client) Add(ctx context.Context, req AddRequest) error {
@@ -106,6 +136,9 @@ func (c *Mem0Client) Add(ctx context.Context, req AddRequest) error {
 	if req.Infer != nil {
 		payload["infer"] = *req.Infer
 	}
+
+	ctx, cancel := c.withTimeout(ctx, c.writeTimeout)
+	defer cancel()
 
 	var raw map[string]any
 	return c.postJSON(ctx, c.addPath(), payload, &raw)

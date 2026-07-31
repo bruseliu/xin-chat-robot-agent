@@ -10,6 +10,7 @@ import json
 import signal
 import sys
 import struct
+import threading
 from collections import deque
 
 import pyaudio
@@ -28,12 +29,18 @@ pa = pyaudio.PyAudio()
 
 
 class TTSPlayer:
-    """Plays PCM audio received from the server."""
+    """Plays PCM audio in a background thread so WebSocket reads are never blocked."""
 
     def __init__(self):
         self._stream = None
-        self._buffer = deque()
         self._sample_rate = 16000
+        self._queue = deque()
+        self._lock = threading.Lock()
+        self._has_data = threading.Event()
+        self._finished = threading.Event()  # signals no more data coming
+        self._done = threading.Event()      # signals playback thread exited
+        self._thread = None
+        self._interrupted = False
         self.playing = False
 
     def start(self, sample_rate: int):
@@ -45,16 +52,63 @@ class TTSPlayer:
             channels=1,
             rate=self._sample_rate,
             output=True,
-            frames_per_buffer=1024,
+            frames_per_buffer=2048,
         )
+        self._interrupted = False
+        self._queue.clear()
+        self._has_data.clear()
+        self._finished.clear()
+        self._done.clear()
         self.playing = True
+        self._thread = threading.Thread(target=self._play_loop, daemon=True)
+        self._thread.start()
+
+    def _play_loop(self):
+        try:
+            while not self._interrupted:
+                if not self._queue:
+                    if self._finished.is_set():
+                        break
+                    self._has_data.wait(timeout=0.1)
+                    self._has_data.clear()
+                    continue
+                with self._lock:
+                    chunk = self._queue.popleft()
+                if self._stream and not self._stream.is_stopped():
+                    self._stream.write(chunk)
+            # Flush: write silence to push remaining audio through hardware buffer
+            if not self._interrupted and self._stream and not self._stream.is_stopped():
+                silence = b'\x00' * (self._sample_rate * 2 * 300 // 1000)
+                self._stream.write(silence)
+        finally:
+            self._done.set()
 
     def feed(self, pcm: bytes):
-        if self._stream and not self._stream.is_stopped():
-            self._stream.write(pcm)
+        with self._lock:
+            self._queue.append(pcm)
+        self._has_data.set()
+
+    def flush(self):
+        """Signal no more data and wait for playback to complete."""
+        self._finished.set()
+        self._has_data.set()
+        self._done.wait(timeout=300)
+        self._close_stream()
+        self.playing = False
 
     def stop(self):
+        """Immediately interrupt playback (barge-in)."""
+        self._interrupted = True
+        self._finished.set()
+        self._has_data.set()
+        self._done.wait(timeout=2)
+        self._close_stream()
         self.playing = False
+
+    def _close_stream(self):
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
         if self._stream:
             try:
                 self._stream.stop_stream()
@@ -132,8 +186,8 @@ async def recv_messages(ws: websockets.WebSocketClientProtocol, player: TTSPlaye
                 player.start(sr)
 
             elif msg_type == "tts_end":
+                await asyncio.get_event_loop().run_in_executor(None, player.flush)
                 print("  [TTS end]")
-                player.stop()
 
             elif msg_type == "tts_error":
                 print(f"\n  [TTS error] {msg.get('error', '')}")
@@ -154,7 +208,7 @@ async def main():
     print(f"[client] Connecting to {url}")
 
     try:
-        async with websockets.connect(url, max_size=10 * 1024 * 1024) as ws:
+        async with websockets.connect(url, max_size=10 * 1024 * 1024, ping_interval=30, ping_timeout=60) as ws:
             print("[client] Connected. Press Ctrl+C to stop.\n")
 
             send_task = asyncio.create_task(send_mic_audio(ws, stop_event, player))

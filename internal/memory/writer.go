@@ -103,11 +103,30 @@ func (w *Writer) consume(userID string, ch chan AddRequest) {
 }
 
 func (w *Writer) process(req AddRequest) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if req.done != nil {
+		close(req.done)
+		return
+	}
+	// Generous: the store applies its own write deadline, and this only needs to
+	// stop a wedged request from pinning the per-user queue forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if err := w.store.Add(ctx, req); err != nil {
 		w.logger.Warn("memory write failed", "error", err, "user_id", req.UserID)
 	}
+}
+
+// Flush blocks until all pending writes for the given user are processed.
+func (w *Writer) Flush(userID string) {
+	w.mu.Lock()
+	ch, ok := w.queues[userID]
+	w.mu.Unlock()
+	if !ok {
+		return
+	}
+	done := make(chan struct{})
+	ch <- AddRequest{UserID: userID, done: done}
+	<-done
 }
 
 func (w *Writer) Close() {
