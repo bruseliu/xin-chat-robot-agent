@@ -35,6 +35,7 @@ type Server struct {
 	ttsFactory     voice.TTSFactory
 	sampleRate     int
 	onSessionClose SessionCloseFunc
+	bargeIn        voice.BargeInConfig
 }
 
 type ServerOption func(*Server)
@@ -45,6 +46,10 @@ func WithSessionClose(fn SessionCloseFunc) ServerOption {
 
 func WithTTSFactory(f voice.TTSFactory) ServerOption {
 	return func(s *Server) { s.ttsFactory = f }
+}
+
+func WithBargeIn(cfg voice.BargeInConfig) ServerOption {
+	return func(s *Server) { s.bargeIn = cfg }
 }
 
 func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger, vadFactory VADFactory, asrFactory ASRFactory, opts ...ServerOption) *Server {
@@ -214,6 +219,7 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 			"transport": "websocket",
 		},
 		TTSFactory: s.ttsFactory,
+		BargeIn:    s.bargeIn,
 	})
 	if err != nil {
 		if processor != nil {

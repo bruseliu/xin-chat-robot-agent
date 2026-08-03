@@ -88,6 +88,9 @@ func main() {
 
 	memWriter := memory.NewWriter(memClient, memory.WriterConfig{}, logger)
 	pipeline := voice.NewPipeline(agentRunner, memWriter, logger)
+	// Barge-in also needs the client to keep sending microphone audio while TTS
+	// plays, so log the server's half to make a mismatch obvious.
+	logger.Info("barge-in config", "enabled", cfg.BargeIn.Enabled, "drain_timeout", cfg.BargeIn.DrainTimeout)
 	ttsFactory, err := newTTSFactory(cfg.TTS)
 	if err != nil {
 		logger.Error("create TTS factory failed", "error", err)
@@ -104,6 +107,10 @@ func main() {
 			return newASRStream(ctx, cfg.ASR, logger)
 		},
 		api.WithTTSFactory(ttsFactory),
+		api.WithBargeIn(voice.BargeInConfig{
+			Enabled:      cfg.BargeIn.Enabled,
+			DrainTimeout: cfg.BargeIn.DrainTimeout,
+		}),
 		api.WithSessionClose(func(ctx context.Context, userID, sessionID string) {
 			memWriter.Flush(userID)
 			if err := sessionService.Delete(ctx, &adksession.DeleteRequest{

@@ -1672,3 +1672,178 @@ func (s sessionView) Events() adksession.Events {
 3. **`llmagent.Config.Description` 仍是英文** — 会进 system instruction，建议改中文。
 4. **记忆注入无相关性阈值** — 当前固定注入 top 8，不管分数高低。噪声记忆仍可能挤掉有用记忆。
 5. **`scripts/` 目录多个 `package main`** — `go test ./...` 报重复 main 声明（既有问题，非本轮引入）。
+
+---
+
+## Development Log: Barge-in（打断）+ 客户端播放器重写 + 记忆污染修复 (2026-08-03)
+
+### 1. Barge-in — TTS/LLM 进行中被第二句打断
+
+**改动前是严格半双工**，三处各自独立地阻断了打断：
+
+- `consumeServerEndpointingTranscripts` 在单 goroutine 里**同步阻塞**调用 `runTextTurn`，turn 1 跑完前读不到第二句
+- `ProcessAudio` 在 `turnActive` 为真时把 `vadOut.VADEnd` **整个吞掉**，本轮不发 SEGMENT_END，FunASR 永不解码第二句
+- 客户端在播放期间**硬静音**，服务端连音频都收不到
+- 且没有 per-turn 的 `context.CancelFunc`，`s.ctx` 只在整条 WS 断开时才取消
+
+**触发时机**是句末打断：信号只能来自 FunASR 的 sentence-final，它依赖 Silero `VADEnd`（静音 200ms）+ SEGMENT_END 解码（64-90ms）。用户说话时 TTS 仍在播，停下约 300ms 后切断。说话即时压低（ducking）需要 `AudioProcessor` 暴露 speech-start 信号，未做。
+
+**回声前提**：本轮明确不处理 TTS 回采，开发戴耳机。方案假定输入无回声，不做文本相似度或时序过滤。`BARGE_IN_ENABLED=false` 可回退到半双工。
+
+#### 核心机制（`internal/voice/session.go`）
+
+**turn 异步化 + 输出纪元**。sentence 循环只做调度，turn 跑在独立 goroutine 里带自己的可取消 context：
+
+```go
+turnMu     sync.Mutex          // 只保护 turnCancel / turnDone
+turnCancel context.CancelFunc
+turnDone   chan struct{}
+turnSeq    atomic.Uint64       // 输出纪元
+emitMu     sync.Mutex          // 让「校验纪元+发送」相对「递增纪元」原子
+closed     chan struct{}       // 解开 teardown 时阻塞的 emit
+```
+
+全部 8 处 `s.outputs <-` 改走 `emit(seq, out)` / `emitControl(out)`。`emitMu` 不能用 atomic 替代——它保证"校验纪元后发送"与"递增纪元后发 interrupt"互斥，这是**杜绝陈旧帧排在 interrupt 之后**的依据。`select` 带 `<-s.closed` 分支顺带修掉一个既有隐患：api 侧 writer goroutine 已返回时，阻塞的 `s.outputs <-` 会永久卡住并让 `closeSession` 卡在 `<-writerDone`。
+
+**打断序列**（`interruptTurn`）：
+
+1. `turnMu` 下 copy-and-clear cancel/done（使并发调用幂等），**不持锁等待**（否则第二次打断死锁）
+2. `emitMu` 下递增纪元 —— **在 cancel 之前**，让垂死 turn 解绕时产生的帧全部被丢弃
+3. `cancel()` 停 LLM
+4. `cancelActiveTTS()` 停 TTS
+5. 等 `done`（`DrainTimeout` 上限）
+6. 发 `interrupt` 标记 —— 在等待**之后**，所以正常路径下陈旧音频严格早于标记
+
+**`tts_end` 必须被纪元丢弃**，这条比丢音频更要紧：客户端的 `tts_end` 分支会 `flush()`，即**播完**队列，与打断意图正好相反。
+
+**TTS 取消必须 Cancel + Close 且 forwarder 持续排空，缺一不可**。豆包的两个硬约束：`Cancel`（`tts/doubao.go:140`）只写 CancelSession 帧，**不关闭 `Audio()`**；`readLoop`（:208）在 `s.audio <-` 上**阻塞发送**，没人再收就永久停住，`defer close(s.audio)` 永不执行——而 `Close()` 的 `conn.Close()` **解不开一个已阻塞在 channel 发送上的 goroutine**，结果 goroutine + 连接双泄漏。所以 `forwardTTSAudio` 改成一直排空到两个 channel 关闭（错误分支的 `return` 改 `continue`），取消后继续接收但不再 emit。
+
+**结果分类先判 `ctx.Err()`**：拆连接会让本轮自己的 `Finish`/`WriteText` 写失败，那个写错误会盖住 `ctx.Err()`；不先判就会**每次打断都误报一个 `turn_error`**。这也顺带化解了 `agent/types.go:165` 的坑（`yield` 返回 false 时 `err == nil`，与正常完成无法区分）。
+
+**`ProcessAudio` 放行 SEGMENT_END**：`turnActive` 的吞掉改为 `!bargeIn.Enabled && turnActive.Load()`；新增 `!asrWrote` 门避免强制解码空段、避免无谓重新触发服务端的 `_force_speech_on_next_audio`。`asrWrote` 仍只由 `ProcessAudio` goroutine 拥有。
+
+**实现中发现的方案外错误**：ASR 流正常结束时原本会**取消**还在播的那一轮。输入结束不该截断正在说的回复——取消只在 `Close()` 时才对。故拆成 `awaitTurn()`（正常结束等待，不取消、不超时）和 `interruptTurn()`（拆除时取消）。`awaitTurn` 刻意不超时：提前返回会让调用方在 turn 还能 emit 时就关掉 outputs；而 `interruptTurn` 在自己的有限等待**之前**已retire 纪元，所以它放弃的 turn 已经被静音。这是既有测试 `session_tts_test.go` 抓出来的，最终该测试未经修改即通过。
+
+**不使用 `rotateASR`**：它重新赋值 `s.asr`/`s.endpointing`，而 `s.asr` 由 `ProcessAudio` 独占，从 sentence 循环调用是数据竞争；更要紧的是循环只在 `:155-156` **捕获一次** channel，rotate 关闭旧 channel 会让循环把两者置 nil 从而**退出并关闭 `outputs`**，直接杀死会话。第二句已解码完成，直接当新一轮跑即可（额外开销 0ms）。
+
+#### 客户端配合
+
+`MIC_MUTE_DURING_TTS = False` 解开播放期静音（barge-in 成立的前提）；新增 `interrupt` 分支调 `player.stop()` 丢弃队列；`accepting` 标志结构性拒收有效播放窗口外的 PCM。
+
+### 2. 客户端播放器重写 —— 修"聊十几轮后完全没反应"
+
+**现象**：barge-in 正常工作十余轮后，客户端对服务端的回复完全无反应。
+
+**排查**：一开始判断为"客户端没更新"（那次确实如此），但更新后复现。服务端收音频时没有任何日志，导致"没有 SEGMENT_END"分不清三种情况：客户端没发 / 发了但 VAD 没触发 / 被新加的 `asrWrote` 门挡住。加了两条探针后一次定位：
+
+- `audio ingest alive`（每 100 帧 ≈ 20 秒一条，带累计帧数/语音帧数/`turn_active`）
+- `vad end ignored, no audio since last segment end`
+
+日志给出决定性证据——**服务端全程正常**：
+
+```
+16:20:50  ingest: chunks=700 speech=69 turn_active=False   ← 上行没断
+16:20:58  SENTENCE: 你还在吗？你还在吗？                      ← 服务端确实收到并处理了
+16:20:58  *** interrupted
+```
+
+用户以为没反应的那段时间里，服务端收到了"你还在吗"和"喂喂喂"并正常起了新一轮。卡住的是**客户端接收/渲染侧**。
+
+**根因**：客户端每轮 TTS 都开关一次 PyAudio 输出流，打断时还额外多一次。反复几十次后 ALSA 被拖住，播放线程卡在 `stream.write()`，于是 `flush()` 干等 300 秒——而 `recv_messages` 正 `await` 它，WebSocket 一条消息都不再处理。麦克风是独立 task，所以照常上行。**这是解开静音后播放流开关变频繁带来的连带影响。**
+
+**修法**：输出流整个会话只开一次并复用，播放线程常驻。
+
+| 方法 | 之前 | 现在 |
+|---|---|---|
+| `start()` | 关旧流、开新流、起新线程 | 确保流存在（首次才开）、清队列 |
+| `flush()` | 阻塞等播完 + 关流（最长 300s） | 只置标志，**不阻塞** |
+| `stop()` | 阻塞 join 线程 + 关流 | 清队列，**不阻塞** |
+| `close()`（新增） | — | 只在退出时关流和线程 |
+
+因所有方法变为非阻塞，`recv_messages` 里几处 `run_in_executor` 一并去掉——少一层就少一个卡点。原先靠关流避免尾音截断的 300ms 静音也不再需要：流不关，写进去的音频一定播完。
+
+**行为变化**：`[TTS end]` 现在在音频播完**之前**打印（含义变为"服务端发完了"），仅影响显示时序。
+
+### 3. 记忆污染 —— "问我是谁答不知道"
+
+记忆没丢，是被污染 + 被挤掉。
+
+**直接原因**：一条自相矛盾的否认记忆，来自用户说的"我可没说过"：
+
+```
+0.858  用户否认自己曾说过自己喜欢吃西瓜皮、对故事、篮球运动员以及《出师表》感兴趣，
+       也否认曾同意被称呼为'爸爸'
+```
+
+mem0 把一次对话纠正存成了**独立事实**，而不是去更新被否认的那几条。它与真实身份记忆并列注入，LLM 读到"用户否认曾同意被称呼为爸爸"就答不知道。
+
+**放大原因**：21 条里 14 条是"用户对 X 感兴趣"（世界杯冠军、姚明身高、科比、艺术与诗歌、故事、幽默故事……）。这是上一轮修"数学问题没被记住"时**改过头**的后果——让它提取请求背后的兴趣，它就给每个提问都造一条。且所有分数挤在 0.84–0.88 极窄区间，排序几乎不区分，top_k=8 全被占满。
+
+**`custom_instructions` 第三次调整**：
+
+- 否认/纠正**绝不存成新事实**；矛盾是"去更新或删除被它否认的那条"的指令，不留纠正痕迹
+- 单次提问不造兴趣记忆——问一次是好奇不是特质，只有明确表达喜好或反复回到某话题才存；宁可不存也别存"用户对 X 感兴趣"
+- 身份与称呼提到规则首位
+
+> 三次调整的教训串起来：第一次存了太多噪声（一次性指令、寒暄），第二次过滤过头（连兴趣一起丢），第三次噪声换了形态（每问必造兴趣 + 否认入库）。规则要针对"记成什么形式"，而不是"是否是某类输入"。
+
+**顺带发现一个会误导排查的接口缺陷**：数据库里 21 条，但 `GET /memories?user_id=` 只返回 20 条，漏掉的正好是那条否认记忆——`search`（agent 实际走的路径）能看到它。**查看记忆应以数据库为准**：
+
+```bash
+PGPASSWORD=mem0pass psql -h 127.0.0.1 -U mem0 -d mem0 -tAc \
+  "SELECT payload->>'data' FROM memories WHERE payload->>'user_id'='test-user';"
+```
+
+已清空 test-user 全部 21 条，从零用新规则重新积累（数据库计数与 `search` 双向确认为 0）。
+
+### 本轮改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `internal/voice/session.go` | turn 异步化、per-turn cancel、纪元 emit、`cancelActiveTTS`/`abortSpeech`/`awaitTurn`、forwarder 排空、`ProcessAudio` 放行 SEGMENT_END、`Close()` 取消在飞 turn、两条摄入探针 |
+| `internal/voice/barge_in.go`（新） | `BargeInConfig` 及零值归一化 |
+| `internal/voice/barge_in_test.go`（新） | 可取消的 runner/TTS fake + 5 个测试 |
+| `client/voice_client.py` | 播放器重写为常驻输出流、解静音、`interrupt` 处理、`accepting` 标志 |
+| `internal/config/config.go`、`internal/api/server.go`、`cmd/server/main.go` | `BargeInConfig` 透传 + `WithBargeIn` + 启动日志 |
+| `.env`、`.env.example` | `BARGE_IN_ENABLED`、`BARGE_IN_DRAIN_TIMEOUT_MS` |
+| `/data/liuxin/mem0/server/main.py` | `custom_instructions` 第三次调整 |
+
+### 验证
+
+新增 5 个测试，并做**变异验证**确认不是空转：
+
+| 测试 | 破坏什么会让它失败 |
+|---|---|
+| `TestBargeInCancelsRunningTurn` | — |
+| `TestBargeInEmitsNoTTSEndForCancelledTurn` | 同时移除纪元守卫和 forwarder 的 ctx 抑制 → 抓到泄漏的 `tts_end` |
+| `TestBargeInDuringLLMBeforeTTS` | 覆盖 `abortSpeech` 的 `speechDone == nil` 路径 |
+| `TestSegmentEndSentDuringActiveTurn` | 两种 flag 状态都断言（锁住回退路径） |
+| `TestSessionOutputsCloseWhileTurnInFlight` | `Close()` 不再取消 turn → outputs 永不关闭 |
+
+单个守卫移除时测试仍通过——两道防线互为冗余，这是设计意图；同时移除才失败，说明测试有效。
+
+途中 fake 暴露一个真实细节：`Cancel` 会被调用两次（打断路径 + turn 自己的收尾）。真实豆包客户端第二次只返回写错误，fake 起初未建模而 panic，已按同样契约修正。
+
+`gofmt`/`go vet` 干净，`go test -race ./internal/...` 全绿，既有测试未经修改通过。
+
+### 当前状态
+
+| 项 | 状态 |
+|---|---|
+| Barge-in | ✅ 已实现并 E2E 验证（4 次打断全部 `turn_active=True`） |
+| 客户端长时间稳定性 | ✅ 播放器重写，已消除 ALSA 拖垮导致的渲染停滞 |
+| 记忆提取规则 | ⚠️ 第三版待验证（否认不入库、单次提问不造兴趣） |
+| test-user 记忆 | 已清空，从零积累 |
+| Echo/回声 | ⚠️ 仍需 AEC；当前靠耳机 + `BARGE_IN_ENABLED=false` 回退 |
+
+### 遗留问题（累积）
+
+1. **无 AEC 则 barge-in 与外放不可兼得** — 播放期麦克风信号在物理上无法区分"用户说话"和"自己的 TTS 绕回"。外放需 AEC，或把 `BARGE_IN_ENABLED` 与客户端 `MIC_MUTE_DURING_TTS` 一起翻回半双工。
+2. **打断即时性受限于句末检测** — 约 300ms（静音 200ms + 解码 ~80ms）。要做说话即时压低需给 `vad.AudioOutput` 加 `SpeechStarted`（`audio_gate.go` 已算出该状态，只是没暴露），但无 AEC 时会被回声频繁误触发。
+3. **被打断的 turn 不写 mem0** — `HandleTextTurnStream` 在 `writer.Enqueue` 之前就因 error 返回，而 ADK session 里可能已存用户消息 + 部分助手回复。行为与改动前一致，未改动；**半写事件正是 `sessionstore` 两次 off-by-one 的形状，值得专门 E2E 复验**（打断后问"我刚才说了什么"）。
+4. **FunASR 侧状态持续累积** — `audio_buffer`/`locked_sentences` 不断增长，已解码文本还会作为后续解码上下文。服务端已有 `reset()` 方法（`deploy/funasr/segment-end.patch:53-59`）只是没挂成命令；要用需补丁加 `RESET` 分支 + Go 侧实现 `FunASRASR.Reset()`。注意 `publishSentence` 去重键为 `"<start>:<end>:<text>"` 且 `seen` map 从不清理，服务端 reset 后时间戳归零会吞掉合法重复；`seen` 无锁、由 readLoop 独占，只能在 readLoop 观察到 `reset` 事件时清理。
+5. **`GET /memories` 漏报最后一条** — 查看记忆请以数据库为准（见上）。
+6. **mem0 写入耗时随库大小增长** — 1 条时 4.5s，20 条时 >30s。当前靠放宽超时绕过，不是解决。
+7. **记忆注入无相关性阈值** — 固定 top 8 不看分数。分数普遍挤在 0.84–0.88，排序区分度低，噪声仍可能挤掉有用记忆。
+8. **`llmagent.Config.Description` 仍是英文** — 会进 system instruction。
+9. **`scripts/` 目录多个 `package main`** — `go test ./...` 报重复 main（既有问题）。

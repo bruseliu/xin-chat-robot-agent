@@ -16,6 +16,15 @@ type Config struct {
 	VAD     VADConfig
 	ASR     ASRConfig
 	TTS     TTSConfig
+	BargeIn BargeInConfig
+}
+
+// BargeInConfig controls whether a new utterance interrupts the reply in
+// progress. Requires echo-free input: with speakers and no AEC the microphone
+// hears the assistant's own TTS, which would interrupt itself.
+type BargeInConfig struct {
+	Enabled      bool
+	DrainTimeout time.Duration
 }
 
 type SessionConfig struct {
@@ -139,6 +148,10 @@ func Load() Config {
 			MaxSpeechMs:          envInt("VAD_MAX_SPEECH_MS", 15000),
 		},
 		TTS: TTSConfig{Provider: envString("TTS_PROVIDER", "none"), DoubaoURL: envString("DOUBAO_TTS_URL", "wss://openspeech.bytedance.com/api/v3/tts/bidirection"), DoubaoAppID: envString("DOUBAO_TTS_APP_ID", ""), DoubaoAccessToken: envString("DOUBAO_TTS_ACCESS_TOKEN", ""), DoubaoResourceID: envString("DOUBAO_TTS_RESOURCE_ID", "volc.service_type.10029"), DoubaoSpeaker: envString("DOUBAO_TTS_SPEAKER", ""), SampleRate: envInt("DOUBAO_TTS_SAMPLE_RATE", 24000)},
+		BargeIn: BargeInConfig{
+			Enabled:      envBool("BARGE_IN_ENABLED", true),
+			DrainTimeout: time.Duration(envInt("BARGE_IN_DRAIN_TIMEOUT_MS", 500)) * time.Millisecond,
+		},
 		ASR: ASRConfig{
 			Provider:                           envString("ASR_PROVIDER", "none"),
 			FunASRURL:                          envString("FUNASR_URL", "ws://127.0.0.1:10095"),

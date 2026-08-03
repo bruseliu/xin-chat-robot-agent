@@ -25,87 +25,112 @@ MIC_FORMAT = pyaudio.paInt16
 MIC_CHUNK_MS = 200
 MIC_CHUNK_SAMPLES = MIC_SAMPLE_RATE * MIC_CHUNK_MS // 1000
 
+# Muting the mic while TTS plays makes barge-in impossible — the server never
+# receives the utterance that would interrupt. Keep False for headphones (or any
+# echo-free input) and set True for speakers, where the mic would otherwise feed
+# the assistant's own voice back and let it interrupt itself. Pair with
+# BARGE_IN_ENABLED on the server.
+MIC_MUTE_DURING_TTS = False
+
 pa = pyaudio.PyAudio()
 
 
 class TTSPlayer:
-    """Plays PCM audio in a background thread so WebSocket reads are never blocked."""
+    """Plays PCM audio on one long-lived output stream and playback thread.
+
+    The stream is opened once and reused for the whole session. Opening and
+    closing it per utterance wedges ALSA after a few dozen cycles, and because
+    every method here would then have to join the playback thread, a wedged
+    device blocked the WebSocket reader and the client stopped rendering
+    anything at all while the server kept working. Nothing in this class blocks
+    on the audio device, so the event loop can never stall on playback.
+    """
 
     def __init__(self):
         self._stream = None
-        self._sample_rate = 16000
+        self._sample_rate = None
         self._queue = deque()
         self._lock = threading.Lock()
-        self._has_data = threading.Event()
-        self._finished = threading.Event()  # signals no more data coming
-        self._done = threading.Event()      # signals playback thread exited
+        self._wake = threading.Event()
         self._thread = None
-        self._interrupted = False
+        self._running = True
+        # Only frames belonging to a live utterance are queued, so an interrupted
+        # turn cannot be heard even if a stray frame arrives late.
+        self.accepting = False
         self.playing = False
 
-    def start(self, sample_rate: int):
-        self._sample_rate = sample_rate or 16000
+    def _ensure_stream(self, sample_rate: int):
+        if self._stream is not None and self._sample_rate == sample_rate:
+            return
         if self._stream is not None:
-            self.stop()
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                pass
+        self._sample_rate = sample_rate
         self._stream = pa.open(
             format=pyaudio.paInt16,
             channels=1,
-            rate=self._sample_rate,
+            rate=sample_rate,
             output=True,
             frames_per_buffer=2048,
         )
-        self._interrupted = False
-        self._queue.clear()
-        self._has_data.clear()
-        self._finished.clear()
-        self._done.clear()
-        self.playing = True
-        self._thread = threading.Thread(target=self._play_loop, daemon=True)
-        self._thread.start()
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._play_loop, daemon=True)
+            self._thread.start()
 
     def _play_loop(self):
-        try:
-            while not self._interrupted:
-                if not self._queue:
-                    if self._finished.is_set():
-                        break
-                    self._has_data.wait(timeout=0.1)
-                    self._has_data.clear()
-                    continue
-                with self._lock:
+        while self._running:
+            chunk = None
+            with self._lock:
+                if self._queue:
                     chunk = self._queue.popleft()
-                if self._stream and not self._stream.is_stopped():
-                    self._stream.write(chunk)
-            # Flush: write silence to push remaining audio through hardware buffer
-            if not self._interrupted and self._stream and not self._stream.is_stopped():
-                silence = b'\x00' * (self._sample_rate * 2 * 300 // 1000)
-                self._stream.write(silence)
-        finally:
-            self._done.set()
+            if chunk is None:
+                self._wake.wait(timeout=0.1)
+                self._wake.clear()
+                continue
+            stream = self._stream
+            if stream is None:
+                continue
+            try:
+                stream.write(chunk)
+            except Exception:
+                # A device hiccup must not kill playback for the rest of the session.
+                pass
+
+    def start(self, sample_rate: int):
+        """Begin a new utterance."""
+        self._ensure_stream(sample_rate or 16000)
+        with self._lock:
+            self._queue.clear()
+        self.accepting = True
+        self.playing = True
 
     def feed(self, pcm: bytes):
+        if not self.accepting:
+            return
         with self._lock:
             self._queue.append(pcm)
-        self._has_data.set()
+        self._wake.set()
 
     def flush(self):
-        """Signal no more data and wait for playback to complete."""
-        self._finished.set()
-        self._has_data.set()
-        self._done.wait(timeout=300)
-        self._close_stream()
+        """The server finished sending; let what is queued play out."""
+        self.accepting = False
         self.playing = False
 
     def stop(self):
-        """Immediately interrupt playback (barge-in)."""
-        self._interrupted = True
-        self._finished.set()
-        self._has_data.set()
-        self._done.wait(timeout=2)
-        self._close_stream()
+        """Barge-in: drop whatever has not been played yet."""
+        self.accepting = False
         self.playing = False
+        with self._lock:
+            self._queue.clear()
 
-    def _close_stream(self):
+    def close(self):
+        self._running = False
+        self.accepting = False
+        self.playing = False
+        self._wake.set()
         if self._thread:
             self._thread.join(timeout=2)
             self._thread = None
@@ -133,8 +158,9 @@ async def send_mic_audio(ws: websockets.WebSocketClientProtocol, stop_event: asy
             data = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: stream.read(MIC_CHUNK_SAMPLES, exception_on_overflow=False)
             )
-            if not player.playing:
-                await ws.send(data)
+            if MIC_MUTE_DURING_TTS and player.playing:
+                continue
+            await ws.send(data)
     except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
         pass
     finally:
@@ -186,8 +212,14 @@ async def recv_messages(ws: websockets.WebSocketClientProtocol, player: TTSPlaye
                 player.start(sr)
 
             elif msg_type == "tts_end":
-                await asyncio.get_event_loop().run_in_executor(None, player.flush)
+                player.flush()
                 print("  [TTS end]")
+
+            elif msg_type == "interrupt":
+                # The server cancelled the turn. Drop what is queued rather than
+                # letting it play out — playing it is the opposite of interrupting.
+                player.stop()
+                print(f"\n  [interrupt] {msg.get('error', '')}")
 
             elif msg_type == "tts_error":
                 print(f"\n  [TTS error] {msg.get('error', '')}")
@@ -234,7 +266,7 @@ async def main():
         print(f"[error] {e}")
         sys.exit(1)
     finally:
-        player.stop()
+        player.close()
         pa.terminate()
         print("[client] Done.")
 
