@@ -28,8 +28,11 @@ type BargeInConfig struct {
 }
 
 type SessionConfig struct {
-	PostgresDSN string
-	AutoMigrate bool
+	PostgresDSN     string
+	AutoMigrate     bool
+	MaxTurns        int
+	TTL             time.Duration
+	CleanupInterval time.Duration
 }
 
 type Mem0Config struct {
@@ -109,8 +112,11 @@ func Load() Config {
 		Env:     envString("APP_ENV", "local"),
 		AgentID: envString("AGENT_ID", "voice-agent"),
 		Session: SessionConfig{
-			PostgresDSN: envString("ADK_SESSION_POSTGRES_DSN", ""),
-			AutoMigrate: envBool("ADK_SESSION_AUTO_MIGRATE", true),
+			PostgresDSN:     envString("ADK_SESSION_POSTGRES_DSN", ""),
+			AutoMigrate:     envBool("ADK_SESSION_AUTO_MIGRATE", true),
+			MaxTurns:        envInt("ADK_SESSION_MAX_TURNS", 20),
+			TTL:             time.Duration(envInt("ADK_SESSION_TTL_HOURS", 168)) * time.Hour,
+			CleanupInterval: time.Duration(envInt("ADK_SESSION_CLEANUP_INTERVAL_MINUTES", 60)) * time.Minute,
 		},
 		Mem0: Mem0Config{
 			Mode:    envString("MEM0_MODE", "self_hosted"),

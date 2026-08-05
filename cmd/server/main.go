@@ -22,6 +22,9 @@ import (
 
 func main() {
 	cfg := config.Load()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -35,26 +38,28 @@ func main() {
 		WriteTimeout: cfg.Mem0.WriteTimeout,
 	}, logger)
 
-	var sessionService adksession.Service
-	if cfg.Session.PostgresDSN != "" {
-		svc, err := sessionstore.NewPostgresService(sessionstore.PostgresConfig{
-			DSN:         cfg.Session.PostgresDSN,
-			AutoMigrate: cfg.Session.AutoMigrate,
-		})
-		if err != nil {
-			logger.Error("create ADK session service failed", "error", err)
-			os.Exit(1)
-		}
-		sessionService = svc
-	} else {
-		logger.Warn("ADK_SESSION_POSTGRES_DSN not set, using in-memory session store")
-		svc, err := sessionstore.NewInMemoryManagedService(sessionstore.Config{MaxTurns: 3})
-		if err != nil {
-			logger.Error("create in-memory session service failed", "error", err)
-			os.Exit(1)
-		}
-		sessionService = svc
+	if cfg.Session.PostgresDSN == "" {
+		logger.Error("ADK_SESSION_POSTGRES_DSN is required for persistent sessions")
+		os.Exit(1)
 	}
+	postgresSessionService, err := sessionstore.NewPostgresService(sessionstore.PostgresConfig{
+		DSN:         cfg.Session.PostgresDSN,
+		AutoMigrate: cfg.Session.AutoMigrate,
+	})
+	if err != nil {
+		logger.Error("create PostgreSQL ADK session service failed", "error", err)
+		os.Exit(1)
+	}
+	managedSessionService, err := sessionstore.NewManagedService(postgresSessionService, sessionstore.Config{
+		TTL:      cfg.Session.TTL,
+		MaxTurns: cfg.Session.MaxTurns,
+	})
+	if err != nil {
+		logger.Error("create managed ADK session service failed", "error", err)
+		os.Exit(1)
+	}
+	var sessionService adksession.Service = managedSessionService
+	startSessionCleanup(ctx, managedSessionService, cfg.AgentID, cfg.Session.CleanupInterval, logger)
 	adkMemoryService := memory.NewADKService(memClient, cfg.AgentID, cfg.Mem0.TopK)
 
 	graph, err := agent.NewGraph(agent.GraphConfig{AgentID: cfg.AgentID})
@@ -113,20 +118,9 @@ func main() {
 		}),
 		api.WithSessionClose(func(ctx context.Context, userID, sessionID string) {
 			memWriter.Flush(userID)
-			if err := sessionService.Delete(ctx, &adksession.DeleteRequest{
-				AppName:   cfg.AgentID,
-				UserID:    userID,
-				SessionID: sessionID,
-			}); err != nil {
-				logger.Warn("delete session on ws close failed", "user_id", userID, "session_id", sessionID, "error", err)
-			} else {
-				logger.Info("session deleted on ws close", "user_id", userID, "session_id", sessionID)
-			}
+			logger.Info("session retained on ws close", "user_id", userID, "session_id", sessionID)
 		}),
 	)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -148,4 +142,36 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+func startSessionCleanup(ctx context.Context, service *sessionstore.ManagedService, appName string, interval time.Duration, logger *slog.Logger) {
+	if service == nil || interval <= 0 {
+		return
+	}
+
+	cleanup := func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		deleted, err := service.DeleteExpired(cleanupCtx, appName, "")
+		if err != nil {
+			logger.Warn("delete expired sessions failed", "error", err)
+			return
+		}
+		if deleted > 0 {
+			logger.Info("expired sessions deleted", "count", deleted)
+		}
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cleanup()
+			}
+		}
+	}()
 }

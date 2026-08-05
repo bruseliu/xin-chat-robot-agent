@@ -222,3 +222,42 @@ func TestManagedServiceWindowedSessionSeesLaterAppends(t *testing.T) {
 		t.Fatalf("last event author = %v, want \"user\"", last)
 	}
 }
+
+func TestManagedServiceDeleteExpiredAllUsers(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	svc, err := NewInMemoryManagedService(Config{
+		TTL: time.Second,
+		Now: func() time.Time {
+			return now.Add(2 * time.Second)
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewInMemoryManagedService() error = %v", err)
+	}
+
+	for _, userID := range []string{"alice", "bob"} {
+		created, err := svc.Create(ctx, &adksession.CreateRequest{
+			AppName:   "app",
+			UserID:    userID,
+			SessionID: "expired",
+		})
+		if err != nil {
+			t.Fatalf("Create(%s) error = %v", userID, err)
+		}
+		if err := svc.AppendEvent(ctx, created.Session, &adksession.Event{
+			Author:    "user",
+			Timestamp: now,
+		}); err != nil {
+			t.Fatalf("AppendEvent(%s) error = %v", userID, err)
+		}
+	}
+
+	deleted, err := svc.DeleteExpired(ctx, "app", "")
+	if err != nil {
+		t.Fatalf("DeleteExpired() error = %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("DeleteExpired() = %d, want 2", deleted)
+	}
+}
