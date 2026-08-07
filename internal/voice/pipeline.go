@@ -3,8 +3,11 @@ package voice
 import (
 	"context"
 	"log/slog"
+	"strings"
+	"time"
 
 	"xin-chat-robot-agent/internal/agent"
+	"xin-chat-robot-agent/internal/conversation"
 	"xin-chat-robot-agent/internal/memory"
 )
 
@@ -21,17 +24,44 @@ type TextTurnOutput struct {
 }
 
 type Pipeline struct {
-	agent  agent.Runner
-	writer *memory.Writer
-	logger *slog.Logger
+	agent      agent.Runner
+	writer     *memory.Writer
+	logger     *slog.Logger
+	recorder   conversation.TurnRecorder
+	compaction conversation.CompactionTrigger
+	appName    string
 }
 
-func NewPipeline(agentRunner agent.Runner, writer *memory.Writer, logger *slog.Logger) *Pipeline {
-	return &Pipeline{
-		agent:  agentRunner,
-		writer: writer,
-		logger: logger,
+type PipelineOption func(*Pipeline)
+
+func WithTurnRecorder(recorder conversation.TurnRecorder) PipelineOption {
+	return func(pipeline *Pipeline) { pipeline.recorder = recorder }
+}
+
+func WithCompactionTrigger(trigger conversation.CompactionTrigger) PipelineOption {
+	return func(pipeline *Pipeline) { pipeline.compaction = trigger }
+}
+
+func WithAppName(appName string) PipelineOption {
+	return func(pipeline *Pipeline) { pipeline.appName = appName }
+}
+
+func NewPipeline(agentRunner agent.Runner, writer *memory.Writer, logger *slog.Logger, options ...PipelineOption) *Pipeline {
+	pipeline := &Pipeline{
+		agent:   agentRunner,
+		writer:  writer,
+		logger:  logger,
+		appName: "voice-agent",
 	}
+	for _, option := range options {
+		if option != nil {
+			option(pipeline)
+		}
+	}
+	if pipeline.logger == nil {
+		pipeline.logger = slog.Default()
+	}
+	return pipeline
 }
 
 func (p *Pipeline) HandleTextTurn(ctx context.Context, input TextTurnInput) (TextTurnOutput, error) {
@@ -39,6 +69,23 @@ func (p *Pipeline) HandleTextTurn(ctx context.Context, input TextTurnInput) (Tex
 }
 
 func (p *Pipeline) HandleTextTurnStream(ctx context.Context, input TextTurnInput, yield func(agent.StreamEvent) bool) (TextTurnOutput, error) {
+	var handle conversation.TurnHandle
+	recorded := false
+	if p.recorder != nil && strings.TrimSpace(input.Text) != "" {
+		beginCtx, cancel := context.WithTimeout(ctx, time.Second)
+		begin, err := p.recorder.BeginTurn(beginCtx, conversation.BeginTurnRequest{
+			ConversationKey: conversation.ConversationKey{AppName: p.appName, UserID: input.UserID, ConversationID: input.SessionID},
+			UserText:        input.Text,
+			Source:          turnSource(input.Metadata),
+			IdempotencyKey:  turnIdempotencyKey(input.Metadata),
+		})
+		cancel()
+		if err != nil {
+			p.logger.Warn("record conversation turn start failed", "error", err, "user_id", input.UserID, "session_id", input.SessionID)
+		} else {
+			handle, recorded = begin, true
+		}
+	}
 	events := make([]agent.StreamEvent, 0, 8)
 	output, err := p.agent.RunTurnStream(ctx, agent.TurnInput{
 		UserID:    input.UserID,
@@ -53,8 +100,14 @@ func (p *Pipeline) HandleTextTurnStream(ctx context.Context, input TextTurnInput
 		return yield(event)
 	})
 	if err != nil {
+		p.finishTurn(ctx, handle, recorded, output.Text, conversation.TurnFailed, "agent_run_failed")
 		return TextTurnOutput{}, err
 	}
+	if ctx.Err() != nil {
+		p.finishTurn(ctx, handle, recorded, output.Text, conversation.TurnInterrupted, "")
+		return TextTurnOutput{}, ctx.Err()
+	}
+	p.finishTurn(ctx, handle, recorded, output.Text, conversation.TurnCompleted, "")
 
 	if p.writer != nil {
 		p.writer.Enqueue(memory.AddRequest{
@@ -71,6 +124,9 @@ func (p *Pipeline) HandleTextTurnStream(ctx context.Context, input TextTurnInput
 		})
 	}
 
+	if p.compaction != nil && recorded {
+		p.compaction.Enqueue(handle.ConversationKey)
+	}
 	return TextTurnOutput{
 		Text:   output.Text,
 		Events: events,

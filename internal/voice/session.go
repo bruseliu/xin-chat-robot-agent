@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -113,6 +114,9 @@ type VoiceSession struct {
 	// Ingest counters, owned by the ProcessAudio goroutine.
 	chunksIn       int64
 	speechChunksIn int64
+	inputPeak      float64
+	inputEnergy    float64
+	inputSamples   int64
 }
 
 // audioProbeEveryChunks samples the ingest log. At the client's 200 ms frames
@@ -356,27 +360,33 @@ func (s *VoiceSession) runTextTurn(ctx context.Context, seq uint64, transcript T
 	transcript.IsFinal = true
 	metadata := cloneMetadata(s.cfg.Metadata)
 	metadata["source"] = "voice_session"
+	turnStartedAt := time.Now()
 
 	var speech tts.Stream
 	var speechDone chan struct{}
 	var speechWriteErr error
 	wroteDelta := false
+	firstLLMDelta := false
 	textChunker := tts.NewTextChunker(24)
 	startSpeech := func() error {
 		if speech != nil || s.cfg.TTSFactory == nil || s.outputs == nil {
 			return nil
 		}
-		var err error
-		speech, err = s.cfg.TTSFactory(ctx)
+		nextSpeech, err := s.cfg.TTSFactory(ctx)
 		if err != nil {
 			s.logger.Error("tts create failed", "error", err)
 			return err
 		}
-		s.logger.Info("tts started", "sample_rate", speech.SampleRate())
+		if nextSpeech == nil {
+			return fmt.Errorf("tts factory returned nil stream")
+		}
+		speech = nextSpeech
+		ttsStartedAt := time.Now()
+		s.logger.Info("tts started", "sample_rate", speech.SampleRate(), "asr_final_to_tts_start", time.Since(turnStartedAt))
 		speechDone = make(chan struct{})
 		s.setActiveTTS(speech)
 		s.emit(seq, VoiceTurnOutput{Type: "tts_start", SampleRate: speech.SampleRate()})
-		go s.forwardTTSAudio(ctx, seq, speech, speechDone)
+		go s.forwardTTSAudio(ctx, seq, speech, speechDone, turnStartedAt, ttsStartedAt)
 		return nil
 	}
 	defer func() {
@@ -396,6 +406,10 @@ func (s *VoiceSession) runTextTurn(ctx context.Context, seq uint64, transcript T
 		}
 		if event.Type != agent.StreamEventLLMDelta || event.TextDelta == "" {
 			return true
+		}
+		if !firstLLMDelta {
+			firstLLMDelta = true
+			s.logger.Info("llm first delta", "asr_final_to_llm_first", time.Since(turnStartedAt))
 		}
 		if startErr := startSpeech(); startErr != nil {
 			speechWriteErr = startErr
@@ -463,10 +477,11 @@ func (s *VoiceSession) runTextTurn(ctx context.Context, seq uint64, transcript T
 // this loop stopped receiving, that goroutine would never reach its deferred
 // close and both it and the connection would leak. So on cancellation we drain
 // and discard rather than return.
-func (s *VoiceSession) forwardTTSAudio(ctx context.Context, seq uint64, speech tts.Stream, done chan<- struct{}) {
+func (s *VoiceSession) forwardTTSAudio(ctx context.Context, seq uint64, speech tts.Stream, done chan<- struct{}, turnStartedAt, ttsStartedAt time.Time) {
 	defer close(done)
 	audio, errs := speech.Audio(), speech.Errors()
 	reportedErr := false
+	firstAudio := true
 	for audio != nil || errs != nil {
 		select {
 		case chunk, ok := <-audio:
@@ -478,6 +493,10 @@ func (s *VoiceSession) forwardTTSAudio(ctx context.Context, seq uint64, speech t
 				continue
 			}
 			if len(chunk.PCM) > 0 {
+				if firstAudio {
+					firstAudio = false
+					s.logger.Info("tts first audio", "asr_final_to_tts_first_audio", time.Since(turnStartedAt), "tts_start_to_first_audio", time.Since(ttsStartedAt))
+				}
 				s.emit(seq, VoiceTurnOutput{Type: "tts_audio", AudioPCM: chunk.PCM})
 			}
 			if chunk.Final {
@@ -505,8 +524,19 @@ func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (Voic
 	// Liveness probe: without it, "the assistant stopped responding" cannot be
 	// told apart from "the client stopped sending". Sampled, not per-chunk.
 	s.chunksIn++
+	peak, energy, samples := audioLevel(chunk)
+	if peak > s.inputPeak {
+		s.inputPeak = peak
+	}
+	s.inputEnergy += energy
+	s.inputSamples += samples
 	if s.chunksIn%audioProbeEveryChunks == 0 {
-		s.logger.Info("audio ingest alive", "chunks", s.chunksIn, "speech_chunks", s.speechChunksIn, "turn_active", s.turnActive.Load())
+		inputRMS := 0.0
+		if s.inputSamples > 0 {
+			inputRMS = math.Sqrt(s.inputEnergy / float64(s.inputSamples))
+		}
+		s.logger.Info("audio ingest alive", "chunks", s.chunksIn, "speech_chunks", s.speechChunksIn, "turn_active", s.turnActive.Load(), "input_peak", s.inputPeak, "input_rms", inputRMS)
+		s.inputPeak, s.inputEnergy, s.inputSamples = 0, 0, 0
 	}
 	vadOut, err := s.vad.Process(ctx, vad.Chunk{
 		PCM16LE:    chunk.PCM16LE,
@@ -516,6 +546,10 @@ func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (Voic
 	})
 	if err != nil {
 		return VoiceTurnOutput{}, err
+	}
+	if vadOut.VADStart && s.cfg.BargeIn.Enabled && s.turnActive.Load() {
+		s.logger.Info("vad speech start detected, interrupting active turn")
+		s.interruptTurn("barge_in", true)
 	}
 	if hasAudio(vadOut.Chunk) {
 		if err := s.asr.Write(ctx, vadOut.Chunk); err != nil {
@@ -720,6 +754,32 @@ func (s *VoiceSession) clearActiveTTS(stream tts.Stream) {
 
 func hasAudio(chunk vad.Chunk) bool {
 	return len(chunk.Samples) > 0 || len(chunk.PCM16LE) > 0
+}
+
+// audioLevel returns normalized peak and accumulated squared amplitude for a
+// bounded diagnostic log. It never retains client audio.
+func audioLevel(chunk AudioChunk) (peak, energy float64, samples int64) {
+	consume := func(value float64) {
+		if value < 0 {
+			value = -value
+		}
+		if value > peak {
+			peak = value
+		}
+		energy += value * value
+		samples++
+	}
+	if len(chunk.PCM16LE) > 1 {
+		for i := 0; i+1 < len(chunk.PCM16LE); i += 2 {
+			value := int16(uint16(chunk.PCM16LE[i]) | uint16(chunk.PCM16LE[i+1])<<8)
+			consume(float64(value) / 32768)
+		}
+		return peak, energy, samples
+	}
+	for _, value := range chunk.Samples {
+		consume(float64(value))
+	}
+	return peak, energy, samples
 }
 
 func cloneMetadata(in map[string]string) map[string]string {

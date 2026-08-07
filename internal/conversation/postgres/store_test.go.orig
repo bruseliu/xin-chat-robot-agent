@@ -1,0 +1,172 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"xin-chat-robot-agent/internal/conversation"
+)
+
+func TestNewValidation(t *testing.T) {
+	if _, err := New(Config{}); err == nil {
+		t.Fatal("New() error = nil, want missing DSN error")
+	}
+	if _, err := NewWithDB(nil, Config{}); err == nil {
+		t.Fatal("NewWithDB(nil) error = nil, want database error")
+	}
+}
+
+func TestStorePostgres(t *testing.T) {
+	dsn := os.Getenv("CONVERSATION_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("set CONVERSATION_TEST_POSTGRES_DSN to run PostgreSQL integration tests")
+	}
+
+	schema := fmt.Sprintf("conversation_test_%d", time.Now().UnixNano())
+	store, err := New(Config{DSN: dsn, Schema: schema, AutoMigrate: true, CompactionBatchSize: 2})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.db.Exec("DROP SCHEMA IF EXISTS " + quoteIdentifier(schema) + " CASCADE").Error; err != nil {
+			t.Errorf("drop test schema: %v", err)
+		}
+	})
+
+	ctx := context.Background()
+	key := conversation.ConversationKey{AppName: "app", UserID: "user", ConversationID: "conversation"}
+	first := beginRequest(key, "request-1", "first question")
+	firstHandle, err := store.BeginTurn(ctx, first)
+	if err != nil {
+		t.Fatalf("BeginTurn(first) error = %v", err)
+	}
+	duplicate, err := store.BeginTurn(ctx, first)
+	if err != nil {
+		t.Fatalf("BeginTurn(duplicate) error = %v", err)
+	}
+	if duplicate != firstHandle {
+		t.Fatalf("duplicate handle = %+v, want %+v", duplicate, firstHandle)
+	}
+	if err := store.FinishTurn(ctx, conversation.FinishTurnRequest{Handle: firstHandle, AssistantText: "first answer", Status: conversation.TurnCompleted}); err != nil {
+		t.Fatalf("FinishTurn(first) error = %v", err)
+	}
+
+	secondHandle, err := store.BeginTurn(ctx, beginRequest(key, "request-2", "interrupted question"))
+	if err != nil {
+		t.Fatalf("BeginTurn(second) error = %v", err)
+	}
+	if err := store.FinishTurn(ctx, conversation.FinishTurnRequest{Handle: secondHandle, AssistantText: "partial answer", Status: conversation.TurnInterrupted}); err != nil {
+		t.Fatalf("FinishTurn(second) error = %v", err)
+	}
+
+	thirdHandle, err := store.BeginTurn(ctx, beginRequest(key, "request-3", "third question"))
+	if err != nil {
+		t.Fatalf("BeginTurn(third) error = %v", err)
+	}
+	if err := store.FinishTurn(ctx, conversation.FinishTurnRequest{Handle: thirdHandle, AssistantText: "third answer", Status: conversation.TurnCompleted}); err != nil {
+		t.Fatalf("FinishTurn(third) error = %v", err)
+	}
+
+	loaded, err := store.LoadContext(ctx, key.AppName, key.UserID, key.ConversationID, conversation.ContextLimits{MaxRecentTurns: 10})
+	if err != nil {
+		t.Fatalf("LoadContext() error = %v", err)
+	}
+	if len(loaded.RecentTurns) != 2 {
+		t.Fatalf("LoadContext() turns = %d, want 2 completed turns", len(loaded.RecentTurns))
+	}
+	if loaded.RecentTurns[0].TurnNo != firstHandle.TurnNo || loaded.RecentTurns[1].TurnNo != thirdHandle.TurnNo {
+		t.Fatalf("LoadContext() turn order = %+v, want first then third", loaded.RecentTurns)
+	}
+
+	candidate, err := store.LoadCompactionCandidate(ctx, key.AppName, key.UserID, key.ConversationID, 1)
+	if err != nil {
+		t.Fatalf("LoadCompactionCandidate() error = %v", err)
+	}
+	if len(candidate.Turns) != 1 || candidate.Turns[0].TurnNo != firstHandle.TurnNo {
+		t.Fatalf("compaction candidate = %+v, want first completed turn only", candidate.Turns)
+	}
+	committed, err := store.CommitSummary(ctx, conversation.SummaryCommit{
+		Key:                     key,
+		Text:                    "first question was answered",
+		SummarizedThroughTurnNo: firstHandle.TurnNo,
+		ExpectedVersion:         candidate.Summary.Version,
+	})
+	if err != nil || !committed {
+		t.Fatalf("CommitSummary() = %v, %v; want true, nil", committed, err)
+	}
+	committed, err = store.CommitSummary(ctx, conversation.SummaryCommit{
+		Key:                     key,
+		Text:                    "stale update",
+		SummarizedThroughTurnNo: thirdHandle.TurnNo,
+		ExpectedVersion:         candidate.Summary.Version,
+	})
+	if err != nil || committed {
+		t.Fatalf("stale CommitSummary() = %v, %v; want false, nil", committed, err)
+	}
+}
+
+func TestStorePostgresConcurrentBeginTurn(t *testing.T) {
+	dsn := os.Getenv("CONVERSATION_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("set CONVERSATION_TEST_POSTGRES_DSN to run PostgreSQL integration tests")
+	}
+
+	schema := fmt.Sprintf("conversation_test_%d", time.Now().UnixNano())
+	store, err := New(Config{DSN: dsn, Schema: schema, AutoMigrate: true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.db.Exec("DROP SCHEMA IF EXISTS " + quoteIdentifier(schema) + " CASCADE").Error; err != nil {
+			t.Errorf("drop test schema: %v", err)
+		}
+	})
+
+	key := conversation.ConversationKey{AppName: "app", UserID: "user", ConversationID: "concurrent"}
+	const requests = 12
+	handles := make(chan conversation.TurnHandle, requests)
+	errs := make(chan error, requests)
+	var wg sync.WaitGroup
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			handle, err := store.BeginTurn(context.Background(), beginRequest(key, fmt.Sprintf("request-%d", i), "question"))
+			if err != nil {
+				errs <- err
+				return
+			}
+			handles <- handle
+		}(i)
+	}
+	wg.Wait()
+	close(handles)
+	close(errs)
+	for err := range errs {
+		t.Errorf("BeginTurn() error = %v", err)
+	}
+
+	seen := make(map[int64]bool, requests)
+	for handle := range handles {
+		if seen[handle.TurnNo] {
+			t.Errorf("duplicate turn number %d", handle.TurnNo)
+		}
+		seen[handle.TurnNo] = true
+	}
+	if len(seen) != requests {
+		t.Fatalf("unique turn numbers = %d, want %d", len(seen), requests)
+	}
+}
+
+func beginRequest(key conversation.ConversationKey, idempotencyKey, text string) conversation.BeginTurnRequest {
+	return conversation.BeginTurnRequest{
+		ConversationKey: key,
+		UserText:        text,
+		Source:          "test",
+		IdempotencyKey:  idempotencyKey,
+	}
+}

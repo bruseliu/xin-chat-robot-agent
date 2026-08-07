@@ -7,16 +7,17 @@ import (
 )
 
 type Config struct {
-	Addr    string
-	Env     string
-	AgentID string
-	Mem0    Mem0Config
-	Session SessionConfig
-	LLM     LLMConfig
-	VAD     VADConfig
-	ASR     ASRConfig
-	TTS     TTSConfig
-	BargeIn BargeInConfig
+	Addr      string
+	Env       string
+	AgentID   string
+	Mem0      Mem0Config
+	Session   SessionConfig
+	Retention RetentionConfig
+	LLM       LLMConfig
+	VAD       VADConfig
+	ASR       ASRConfig
+	TTS       TTSConfig
+	BargeIn   BargeInConfig
 }
 
 // BargeInConfig controls whether a new utterance interrupts the reply in
@@ -30,9 +31,22 @@ type BargeInConfig struct {
 type SessionConfig struct {
 	PostgresDSN     string
 	AutoMigrate     bool
+	MaxEvents       int
 	MaxTurns        int
 	TTL             time.Duration
 	CleanupInterval time.Duration
+}
+
+// RetentionConfig controls cleanup of durable conversation audit records.
+// Dry-run is intentionally the default so a new deployment reports scope
+// before it is allowed to remove any rows.
+type RetentionConfig struct {
+	Enabled         bool
+	DryRun          bool
+	RawTTL          time.Duration
+	SummaryTTL      time.Duration
+	CleanupInterval time.Duration
+	BatchSize       int
 }
 
 type Mem0Config struct {
@@ -114,9 +128,18 @@ func Load() Config {
 		Session: SessionConfig{
 			PostgresDSN:     envString("ADK_SESSION_POSTGRES_DSN", ""),
 			AutoMigrate:     envBool("ADK_SESSION_AUTO_MIGRATE", true),
-			MaxTurns:        envInt("ADK_SESSION_MAX_TURNS", 20),
+			MaxEvents:       envInt("ADK_SESSION_MAX_EVENTS", 48),
+			MaxTurns:        envInt("ADK_SESSION_MAX_TURNS", 8),
 			TTL:             time.Duration(envInt("ADK_SESSION_TTL_HOURS", 168)) * time.Hour,
 			CleanupInterval: time.Duration(envInt("ADK_SESSION_CLEANUP_INTERVAL_MINUTES", 60)) * time.Minute,
+		},
+		Retention: RetentionConfig{
+			Enabled:         envBool("CONVERSATION_RETENTION_ENABLED", false),
+			DryRun:          envBool("CONVERSATION_RETENTION_DRY_RUN", true),
+			RawTTL:          time.Duration(envInt("CONVERSATION_RETENTION_RAW_TTL_HOURS", 720)) * time.Hour,
+			SummaryTTL:      time.Duration(envInt("CONVERSATION_RETENTION_SUMMARY_TTL_HOURS", 2160)) * time.Hour,
+			CleanupInterval: time.Duration(envInt("CONVERSATION_RETENTION_CLEANUP_INTERVAL_MINUTES", 60)) * time.Minute,
+			BatchSize:       envInt("CONVERSATION_RETENTION_BATCH_SIZE", 500),
 		},
 		Mem0: Mem0Config{
 			Mode:    envString("MEM0_MODE", "self_hosted"),
@@ -146,7 +169,7 @@ func Load() Config {
 			SileroModelPath:      envString("SILERO_VAD_MODEL_PATH", ""),
 			SampleRate:           envInt("VAD_SAMPLE_RATE", 16000),
 			Threshold:            envFloat32("VAD_THRESHOLD", 0.5),
-			MinSilenceDurationMs: envInt("VAD_MIN_SILENCE_MS", 200),
+			MinSilenceDurationMs: envInt("VAD_MIN_SILENCE_MS", 350),
 			MinSpeechDurationMs:  envInt("VAD_MIN_SPEECH_MS", 250),
 			SpeechPadMs:          envInt("VAD_SPEECH_PAD_MS", 30),
 			PreRollMs:            envInt("VAD_PRE_ROLL_MS", 800),

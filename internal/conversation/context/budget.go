@@ -1,0 +1,178 @@
+package context
+
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"xin-chat-robot-agent/internal/conversation"
+)
+
+const truncationMarker = "..."
+
+func fit(value conversation.Context, maxUnits int) conversation.Context {
+	value.Summary.Text = sanitize(value.Summary.Text)
+	turns := make([]conversation.Turn, 0, len(value.RecentTurns))
+	for _, turn := range value.RecentTurns {
+		if turn.Status != conversation.TurnCompleted {
+			continue
+		}
+		turn.UserText = sanitize(turn.UserText)
+		turn.AssistantText = sanitize(turn.AssistantText)
+		turns = append(turns, turn)
+	}
+	value.RecentTurns = turns
+	if maxUnits <= 0 {
+		value.Summary.Text = ""
+		value.RecentTurns = nil
+		return value
+	}
+
+	for len(value.RecentTurns) > 1 && contextUnits(value) > maxUnits {
+		value.RecentTurns = value.RecentTurns[1:]
+	}
+	if contextUnits(value) <= maxUnits {
+		return value
+	}
+
+	turnUnits := turnsUnits(value.RecentTurns)
+	if turnUnits >= maxUnits {
+		value.Summary.Text = ""
+		value.RecentTurns = trimTurns(value.RecentTurns, maxUnits)
+		return value
+	}
+	value.Summary.Text = truncate(value.Summary.Text, maxUnits-turnUnits)
+	return value
+}
+
+func contextUnits(value conversation.Context) int {
+	return textUnits(value.Summary.Text) + turnsUnits(value.RecentTurns)
+}
+
+func turnsUnits(turns []conversation.Turn) int {
+	total := 0
+	for _, turn := range turns {
+		total += textUnits(turn.UserText) + textUnits(turn.AssistantText)
+	}
+	return total
+}
+
+func trimTurns(turns []conversation.Turn, maxUnits int) []conversation.Turn {
+	if len(turns) == 0 || maxUnits <= 0 {
+		return nil
+	}
+	trimmed := append([]conversation.Turn(nil), turns...)
+	remaining := maxUnits
+	for i := range trimmed {
+		if i == len(trimmed)-1 {
+			trimmed[i] = trimTurn(trimmed[i], remaining)
+			break
+		}
+		units := textUnits(trimmed[i].UserText) + textUnits(trimmed[i].AssistantText)
+		if units > remaining {
+			trimmed[i] = trimTurn(trimmed[i], remaining)
+			return trimmed[:i+1]
+		}
+		remaining -= units
+	}
+	return trimmed
+}
+
+func trimTurn(turn conversation.Turn, maxUnits int) conversation.Turn {
+	if maxUnits <= 0 {
+		turn.UserText = ""
+		turn.AssistantText = ""
+		return turn
+	}
+	userUnits := textUnits(turn.UserText)
+	assistantUnits := textUnits(turn.AssistantText)
+	if userUnits+assistantUnits <= maxUnits {
+		return turn
+	}
+	userBudget := maxUnits / 2
+	if userUnits < userBudget {
+		userBudget = userUnits
+	}
+	assistantBudget := maxUnits - userBudget
+	if assistantUnits < assistantBudget {
+		assistantBudget = assistantUnits
+		userBudget = maxUnits - assistantBudget
+	}
+	turn.UserText = truncate(turn.UserText, userBudget)
+	turn.AssistantText = truncate(turn.AssistantText, assistantBudget)
+	return turn
+}
+
+// textUnits estimates provider-neutral token pressure without splitting UTF-8.
+func textUnits(text string) int {
+	latinRunes := 0
+	units := 0
+	for _, runeValue := range sanitize(text) {
+		if isLatinOrDigit(runeValue) {
+			latinRunes++
+			continue
+		}
+		if latinRunes > 0 {
+			units += (latinRunes + 3) / 4
+			latinRunes = 0
+		}
+		units++
+	}
+	if latinRunes > 0 {
+		units += (latinRunes + 3) / 4
+	}
+	return units
+}
+
+func truncate(text string, maxUnits int) string {
+	text = sanitize(text)
+	if maxUnits <= 0 {
+		return ""
+	}
+	if textUnits(text) <= maxUnits {
+		return text
+	}
+	markerUnits := textUnits(truncationMarker)
+	if maxUnits <= markerUnits {
+		return truncateMarker(maxUnits)
+	}
+	budget := maxUnits - markerUnits
+	var builder strings.Builder
+	used := 0
+	latinRunes := 0
+	for _, runeValue := range text {
+		increment := 1
+		if isLatinOrDigit(runeValue) {
+			latinRunes++
+			if latinRunes%4 != 1 {
+				increment = 0
+			}
+		} else {
+			latinRunes = 0
+		}
+		if used+increment > budget {
+			break
+		}
+		builder.WriteRune(runeValue)
+		used += increment
+	}
+	return builder.String() + truncationMarker
+}
+
+func truncateMarker(maxUnits int) string {
+	if maxUnits <= 0 {
+		return ""
+	}
+	return strings.Repeat(".", maxUnits)
+}
+
+func sanitize(text string) string {
+	if utf8.ValidString(text) {
+		return text
+	}
+	return strings.ToValidUTF8(text, "?")
+}
+
+func isLatinOrDigit(runeValue rune) bool {
+	return runeValue <= unicode.MaxASCII && (unicode.IsLetter(runeValue) || unicode.IsDigit(runeValue))
+}

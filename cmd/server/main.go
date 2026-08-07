@@ -12,6 +12,9 @@ import (
 	"xin-chat-robot-agent/internal/agent"
 	"xin-chat-robot-agent/internal/api"
 	"xin-chat-robot-agent/internal/config"
+	conversationcontext "xin-chat-robot-agent/internal/conversation/context"
+	conversationpostgres "xin-chat-robot-agent/internal/conversation/postgres"
+	"xin-chat-robot-agent/internal/conversation/retention"
 	"xin-chat-robot-agent/internal/memory"
 	"xin-chat-robot-agent/internal/sessionstore"
 	"xin-chat-robot-agent/internal/vad"
@@ -51,8 +54,9 @@ func main() {
 		os.Exit(1)
 	}
 	managedSessionService, err := sessionstore.NewManagedService(postgresSessionService, sessionstore.Config{
-		TTL:      cfg.Session.TTL,
-		MaxTurns: cfg.Session.MaxTurns,
+		TTL:       cfg.Session.TTL,
+		MaxEvents: cfg.Session.MaxEvents,
+		MaxTurns:  cfg.Session.MaxTurns,
 	})
 	if err != nil {
 		logger.Error("create managed ADK session service failed", "error", err)
@@ -61,6 +65,20 @@ func main() {
 	var sessionService adksession.Service = managedSessionService
 	startSessionCleanup(ctx, managedSessionService, cfg.AgentID, cfg.Session.CleanupInterval, logger)
 	adkMemoryService := memory.NewADKService(memClient, cfg.AgentID, cfg.Mem0.TopK)
+	conversationStore, err := conversationpostgres.New(conversationpostgres.Config{
+		DSN:         cfg.Session.PostgresDSN,
+		AutoMigrate: cfg.Session.AutoMigrate,
+	})
+	if err != nil {
+		logger.Error("create conversation PostgreSQL store failed", "error", err)
+		os.Exit(1)
+	}
+	conversationReader, err := conversationcontext.New(conversationStore, conversationcontext.Config{})
+	if err != nil {
+		logger.Error("create conversation context reader failed", "error", err)
+		os.Exit(1)
+	}
+	startConversationRetention(ctx, cfg.Retention, cfg.Session.PostgresDSN, logger)
 
 	graph, err := agent.NewGraph(agent.GraphConfig{AgentID: cfg.AgentID})
 	if err != nil {
@@ -74,7 +92,7 @@ func main() {
 		logger.Info("adk graph", "edge", line)
 	}
 
-	rootAgent, err := newLLMAgent(context.Background(), cfg.LLM, cfg.AgentID, memClient, logger)
+	rootAgent, err := newLLMAgent(context.Background(), cfg.LLM, cfg.AgentID, memClient, conversationReader, logger)
 	if err != nil {
 		logger.Error("create ADK LLM agent failed", "error", err)
 		os.Exit(1)
@@ -91,8 +109,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	compactionTrigger, err := startConversationCompaction(ctx, cfg.LLM, conversationStore, logger)
+	if err != nil {
+		logger.Error("start conversation compaction failed", "error", err)
+		os.Exit(1)
+	}
 	memWriter := memory.NewWriter(memClient, memory.WriterConfig{}, logger)
-	pipeline := voice.NewPipeline(agentRunner, memWriter, logger)
+	pipeline := voice.NewPipeline(agentRunner, memWriter, logger, voice.WithAppName(cfg.AgentID), voice.WithTurnRecorder(conversationStore), voice.WithCompactionTrigger(compactionTrigger))
 	// Barge-in also needs the client to keep sending microphone audio while TTS
 	// plays, so log the server's half to make a mismatch obvious.
 	logger.Info("barge-in config", "enabled", cfg.BargeIn.Enabled, "drain_timeout", cfg.BargeIn.DrainTimeout)
@@ -142,6 +165,35 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+func startConversationRetention(ctx context.Context, cfg config.RetentionConfig, dsn string, logger *slog.Logger) {
+	if !cfg.Enabled {
+		logger.Info("conversation retention disabled")
+		return
+	}
+
+	store, err := retention.NewPostgresStore(dsn, "")
+	if err != nil {
+		logger.Error("create conversation retention store failed", "error", err)
+		return
+	}
+	worker, err := retention.New(store, retention.Config{
+		Policy: retention.Policy{
+			RawTTL:     cfg.RawTTL,
+			SummaryTTL: cfg.SummaryTTL,
+			BatchSize:  cfg.BatchSize,
+			DryRun:     cfg.DryRun,
+		},
+		Interval: cfg.CleanupInterval,
+		Logger:   logger,
+	})
+	if err != nil {
+		logger.Error("create conversation retention worker failed", "error", err)
+		return
+	}
+	logger.Info("conversation retention started", "dry_run", cfg.DryRun, "interval", cfg.CleanupInterval, "raw_ttl", cfg.RawTTL, "summary_ttl", cfg.SummaryTTL)
+	go worker.Run(ctx)
 }
 
 func startSessionCleanup(ctx context.Context, service *sessionstore.ManagedService, appName string, interval time.Duration, logger *slog.Logger) {

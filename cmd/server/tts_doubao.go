@@ -16,7 +16,11 @@ func newTTSFactory(cfg config.TTSConfig) (voice.TTSFactory, error) {
 		return nil, nil
 	case "doubao":
 		return func(ctx context.Context) (tts.Stream, error) {
-			return tts.NewDoubaoStream(ctx, tts.DoubaoConfig{URL: cfg.DoubaoURL, AppID: cfg.DoubaoAppID, AccessToken: cfg.DoubaoAccessToken, ResourceID: cfg.DoubaoResourceID, Speaker: cfg.DoubaoSpeaker, SampleRate: cfg.SampleRate})
+			stream, err := tts.NewDoubaoStream(ctx, tts.DoubaoConfig{URL: cfg.DoubaoURL, AppID: cfg.DoubaoAppID, AccessToken: cfg.DoubaoAccessToken, ResourceID: cfg.DoubaoResourceID, Speaker: cfg.DoubaoSpeaker, SampleRate: cfg.SampleRate})
+			if err != nil {
+				return nil, err
+			}
+			return stream, nil
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported TTS_PROVIDER %q", cfg.Provider)

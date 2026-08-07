@@ -101,6 +101,7 @@ func (g *AudioGate) Process(ctx context.Context, chunk Chunk) (AudioOutput, erro
 	}
 
 	var out []float32
+	vadStart := false
 	vadEnd := false
 	for g.audio.End()-g.vadRead >= int64(g.windowSize) {
 		if err := ctx.Err(); err != nil {
@@ -113,6 +114,7 @@ func (g *AudioGate) Process(ctx context.Context, chunk Chunk) (AudioOutput, erro
 		}
 		g.vadRead += int64(g.windowSize)
 		started, ended := g.applyProbability(probability)
+		vadStart = vadStart || started
 		if started {
 			start := g.preRollStart()
 			out = append(out, g.audio.CopyRange(start, g.vadRead)...)
@@ -153,7 +155,8 @@ func (g *AudioGate) Process(ctx context.Context, chunk Chunk) (AudioOutput, erro
 			SampleRate: sampleRate,
 			Final:      chunk.Final,
 		},
-		VADEnd: vadEnd,
+		VADEnd:   vadEnd,
+		VADStart: vadStart,
 	}, nil
 }
 

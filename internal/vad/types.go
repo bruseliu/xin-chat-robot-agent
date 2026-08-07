@@ -37,8 +37,9 @@ type Decision struct {
 }
 
 type AudioOutput struct {
-	Chunk  Chunk `json:"chunk"`
-	VADEnd bool  `json:"vad_end"`
+	Chunk    Chunk `json:"chunk"`
+	VADStart bool  `json:"vad_start"`
+	VADEnd   bool  `json:"vad_end"`
 }
 
 type AudioProcessor interface {

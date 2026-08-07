@@ -13,12 +13,14 @@ import (
 	"google.golang.org/adk/v2/model/gemini"
 	"google.golang.org/genai"
 
+	"xin-chat-robot-agent/internal/agentcontext"
 	"xin-chat-robot-agent/internal/config"
+	"xin-chat-robot-agent/internal/conversation"
 	llmpkg "xin-chat-robot-agent/internal/llm"
 	"xin-chat-robot-agent/internal/memory"
 )
 
-func newLLMAgent(ctx context.Context, cfg config.LLMConfig, agentID string, memStore memory.Store, logger *slog.Logger) (adkagent.Agent, error) {
+func newLLMAgent(ctx context.Context, cfg config.LLMConfig, agentID string, memStore memory.Store, contextReader conversation.ContextReader, logger *slog.Logger) (adkagent.Agent, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
 	case "", "none":
 		return nil, nil
@@ -36,7 +38,7 @@ func newLLMAgent(ctx context.Context, cfg config.LLMConfig, agentID string, memS
 		if err != nil {
 			return nil, fmt.Errorf("create Gemini model: %w", err)
 		}
-		return newADKLLMAgent(agentID, model, cfg.Instruction, memStore, logger)
+		return newADKLLMAgent(agentID, model, cfg.Instruction, memStore, contextReader, logger)
 	case "doubao":
 		model, err := llmpkg.NewModel(ctx, llmpkg.Config{
 			Provider: "doubao",
@@ -51,20 +53,20 @@ func newLLMAgent(ctx context.Context, cfg config.LLMConfig, agentID string, memS
 		if err != nil {
 			return nil, fmt.Errorf("create Doubao LLM model: %w", err)
 		}
-		return newADKLLMAgent(agentID, model, cfg.Instruction, memStore, logger)
+		return newADKLLMAgent(agentID, model, cfg.Instruction, memStore, contextReader, logger)
 	default:
 		return nil, fmt.Errorf("unsupported LLM_PROVIDER %q", cfg.Provider)
 	}
 }
 
-func newADKLLMAgent(agentID string, llm model.LLM, instruction string, memStore memory.Store, logger *slog.Logger) (adkagent.Agent, error) {
+func newADKLLMAgent(agentID string, llm model.LLM, instruction string, memStore memory.Store, contextReader conversation.ContextReader, logger *slog.Logger) (adkagent.Agent, error) {
 	name := strings.TrimSpace(agentID)
 	if name == "" {
 		name = "voice-agent"
 	}
 	var callbacks []llmagent.BeforeModelCallback
-	if memStore != nil {
-		callbacks = append(callbacks, memoryInjectionCallback(memStore, logger))
+	if memStore != nil || contextReader != nil {
+		callbacks = append(callbacks, agentcontext.New(agentcontext.Config{AppName: name, ContextReader: contextReader, MemoryStore: memStore, Logger: logger}))
 	}
 	agent, err := llmagent.New(llmagent.Config{
 		Name:                 name,

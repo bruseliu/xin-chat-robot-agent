@@ -1,0 +1,111 @@
+// Package agentcontext injects durable conversation context into ADK requests.
+package agentcontext
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	adkagent "google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/model"
+	"google.golang.org/genai"
+
+	"xin-chat-robot-agent/internal/conversation"
+	"xin-chat-robot-agent/internal/memory"
+)
+
+type Config struct {
+	AppName        string
+	ContextReader  conversation.ContextReader
+	MemoryStore    memory.Store
+	SummaryTimeout time.Duration
+	MemoryTimeout  time.Duration
+	Logger         *slog.Logger
+}
+
+func New(config Config) llmagent.BeforeModelCallback {
+	if config.AppName == "" {
+		config.AppName = "voice-agent"
+	}
+	if config.Logger == nil {
+		config.Logger = slog.Default()
+	}
+	if config.SummaryTimeout <= 0 {
+		config.SummaryTimeout = 150 * time.Millisecond
+	}
+	if config.MemoryTimeout <= 0 {
+		config.MemoryTimeout = 150 * time.Millisecond
+	}
+	return func(ctx adkagent.Context, request *model.LLMRequest) (*model.LLMResponse, error) {
+		if request == nil || ctx.UserID() == "" || ctx.SessionID() == "" {
+			return nil, nil
+		}
+		query := lastUserText(request.Contents)
+		var summary conversation.Summary
+		var memories []memory.Memory
+		var summaryErr, memoryErr error
+		var waitGroup sync.WaitGroup
+		if config.ContextReader != nil {
+			waitGroup.Add(1)
+			go func() {
+				defer waitGroup.Done()
+				readCtx, cancel := context.WithTimeout(ctx, config.SummaryTimeout)
+				defer cancel()
+				loaded, err := config.ContextReader.LoadContext(readCtx, config.AppName, ctx.UserID(), ctx.SessionID(), conversation.ContextLimits{})
+				summary, summaryErr = loaded.Summary, err
+			}()
+		}
+		if config.MemoryStore != nil && utf8.RuneCountInString(query) >= 4 {
+			waitGroup.Add(1)
+			go func() {
+				defer waitGroup.Done()
+				readCtx, cancel := context.WithTimeout(ctx, config.MemoryTimeout)
+				defer cancel()
+				memories, memoryErr = config.MemoryStore.Search(readCtx, memory.SearchRequest{UserID: ctx.UserID(), Query: query})
+			}()
+		}
+		waitGroup.Wait()
+		if summaryErr != nil {
+			config.Logger.Warn("conversation summary injection failed", "error", summaryErr, "user_id", ctx.UserID(), "session_id", ctx.SessionID())
+		}
+		if memoryErr != nil {
+			config.Logger.Warn("memory profile injection failed", "error", memoryErr, "user_id", ctx.UserID())
+		}
+		sections := formatSections(summary, memories)
+		if sections == "" {
+			return nil, nil
+		}
+		if request.Config == nil {
+			request.Config = &genai.GenerateContentConfig{}
+		}
+		merged := &genai.Content{Role: genai.RoleUser}
+		if existing := request.Config.SystemInstruction; existing != nil {
+			merged.Role = existing.Role
+			merged.Parts = append(merged.Parts, existing.Parts...)
+		}
+		merged.Parts = append(merged.Parts, &genai.Part{Text: sections})
+		request.Config.SystemInstruction = merged
+		return nil, nil
+	}
+}
+
+func lastUserText(contents []*genai.Content) string {
+	for index := len(contents) - 1; index >= 0; index-- {
+		content := contents[index]
+		if content == nil || content.Role != genai.RoleUser {
+			continue
+		}
+		for _, part := range content.Parts {
+			if part != nil && strings.TrimSpace(part.Text) != "" {
+				return part.Text
+			}
+		}
+	}
+	return ""
+}
+
+var _ = context.Canceled

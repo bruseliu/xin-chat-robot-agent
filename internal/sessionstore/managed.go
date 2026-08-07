@@ -120,11 +120,6 @@ func (s *ManagedService) innerGetRequest(req *adksession.GetRequest) (*adksessio
 		return nil, false
 	}
 	fullView := req.NumRecentEvents == 0 && req.After.IsZero()
-	if s.cfg.MaxTurns > 0 {
-		innerReq := *req
-		innerReq.NumRecentEvents = 0
-		return &innerReq, req.After.IsZero()
-	}
 	if s.cfg.MaxEvents <= 0 {
 		return req, fullView
 	}
