@@ -7,6 +7,7 @@ prints ASR/LLM intermediate results, and plays TTS audio.
 
 import asyncio
 import json
+import os
 import signal
 import sys
 import struct
@@ -16,9 +17,9 @@ from collections import deque
 import pyaudio
 import websockets
 
-SERVER_URL = "ws://192.168.2.99:8080/v1/chat/voice"
-USER_ID = "test-user"
-SESSION_ID = "test-session-1"
+SERVER_URL = os.getenv("VOICE_SERVER_URL", "ws://127.0.0.1:8080/v1/chat/voice")
+USER_ID = os.getenv("VOICE_USER_ID", "test-user")
+SESSION_ID = os.getenv("VOICE_SESSION_ID", "test-session-1")
 MIC_SAMPLE_RATE = 16000
 MIC_CHANNELS = 1
 MIC_FORMAT = pyaudio.paInt16
@@ -240,7 +241,7 @@ async def main():
     print(f"[client] Connecting to {url}")
 
     try:
-        async with websockets.connect(url, max_size=10 * 1024 * 1024, ping_interval=30, ping_timeout=60) as ws:
+        async with websockets.connect(url, max_size=10 * 1024 * 1024, ping_interval=30, ping_timeout=60, proxy=None) as ws:
             print("[client] Connected. Press Ctrl+C to stop.\n")
 
             send_task = asyncio.create_task(send_mic_audio(ws, stop_event, player))

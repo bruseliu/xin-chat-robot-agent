@@ -6,12 +6,19 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 patch_file="$script_dir/external-vad.patch"
 
-if git -C "$FUNASR_HOME" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+if grep -q "External VAD mode: FSMN-VAD disabled" "$FUNASR_HOME/serve_realtime_ws.py" \
+  && grep -q -- "--external-vad" "$FUNASR_HOME/serve_realtime_ws.py"; then
+  :
+elif git -C "$FUNASR_HOME" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
   :
 elif git -C "$FUNASR_HOME" apply --check "$patch_file" >/dev/null 2>&1; then
+  if [[ "${FUNASR_APPLY_PATCH:-0}" != "1" ]]; then
+    printf "%s\n" "external-vad.patch is not applied to $FUNASR_HOME. Inspect the diff, then restart with FUNASR_APPLY_PATCH=1 to apply it." >&2
+    exit 1
+  fi
   git -C "$FUNASR_HOME" apply "$patch_file"
 else
-  printf "%s\n" "external-vad.patch requires the FunASR SEGMENT_END baseline in $FUNASR_HOME/serve_realtime_ws.py" >&2
+  printf "%s\n" "external-vad.patch requires the documented FunASR baseline in $FUNASR_HOME/serve_realtime_ws.py" >&2
   exit 1
 fi
 

@@ -7,9 +7,10 @@ real-time WebSocket protocol used by this service and fits the available RTX
 Keep the ASR service private. The application connects to it through
 `ws://127.0.0.1:10095` by default.
 
-The deployment patch is based on Fun-ASR commit `3f95db6`, which already includes
-`SEGMENT_END`. The launcher applies only `external-vad.patch`; it fails fast for a
-different upstream source layout rather than silently starting with a second VAD.
+The deployment patch is based on Fun-ASR commit `b0b84dc`. It owns the loopback bind,
+`SEGMENT_END`, and external-VAD changes together. The launcher never modifies an
+otherwise clean external checkout unless `FUNASR_APPLY_PATCH=1` is explicitly set;
+a different source layout fails fast rather than silently starting with a second VAD.
 
 ## Install the Service
 
@@ -31,16 +32,16 @@ pip install 'funasr>=1.3.3' 'vllm>=0.12.0'
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
+FUNASR_APPLY_PATCH=1 \
 FUNASR_HOME=/opt/Fun-ASR \
 FUNASR_PYTHON=/opt/Fun-ASR/.venv/bin/python \
 bash deploy/funasr/run-funasr-nano.sh
 ```
 
 The script uses one GPU and one tensor-parallel shard, enables the Chinese
-model, and disables speaker diarization. It also applies
-`bind-loopback.patch` to the upstream service when necessary, because the
-current upstream script otherwise listens on every network interface. The
-private service therefore binds to `127.0.0.1` by default.
+model, disables speaker diarization, and binds the private endpoint to
+`127.0.0.1`. On a clean matching baseline, `FUNASR_APPLY_PATCH=1` is a deliberate
+opt-in to apply the deployment patch; omit it to require a pre-applied patch.
 
 The script sets `VLLM_USE_FLASHINFER_SAMPLER=0` by default. This avoids the
 FlashInfer JIT path, which needs `nvcc`; override it only on hosts with a full
