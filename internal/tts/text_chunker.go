@@ -10,7 +10,7 @@ type TextChunker struct {
 
 func NewTextChunker(maxRunes int) *TextChunker {
 	if maxRunes <= 0 {
-		maxRunes = 24
+		maxRunes = 12
 	}
 	return &TextChunker{maxRunes: maxRunes}
 }

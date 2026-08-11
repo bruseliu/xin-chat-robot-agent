@@ -1838,12 +1838,128 @@ PGPASSWORD=mem0pass psql -h 127.0.0.1 -U mem0 -d mem0 -tAc \
 
 ### 遗留问题（累积）
 
+#### 2026-08-11: 运行时 VAD 漏检调参
+
+在长 TTS 后的真实客户端日志中，麦克风 PCM 仍持续上传，但部分用户语音窗口的 Silero 最大概率只有 `0.492` 或 `0.323`，低于原来的 `VAD_THRESHOLD=0.5`，不会形成新 ASR 段。运行默认阈值调整为 `0.4`；`VAD_MIN_SPEECH_MS=250` 与 `VAD_MIN_SILENCE_MS=350` 保持不变。该调整只降低漏检概率，外放环境的回声分离仍需要 AEC。
+
 1. **无 AEC 则 barge-in 与外放不可兼得** — 播放期麦克风信号在物理上无法区分"用户说话"和"自己的 TTS 绕回"。外放需 AEC，或把 `BARGE_IN_ENABLED` 与客户端 `MIC_MUTE_DURING_TTS` 一起翻回半双工。
 2. **打断即时性受限于句末检测** — 约 300ms（静音 200ms + 解码 ~80ms）。要做说话即时压低需给 `vad.AudioOutput` 加 `SpeechStarted`（`audio_gate.go` 已算出该状态，只是没暴露），但无 AEC 时会被回声频繁误触发。
 3. **被打断的 turn 不写 mem0** — `HandleTextTurnStream` 在 `writer.Enqueue` 之前就因 error 返回，而 ADK session 里可能已存用户消息 + 部分助手回复。行为与改动前一致，未改动；**半写事件正是 `sessionstore` 两次 off-by-one 的形状，值得专门 E2E 复验**（打断后问"我刚才说了什么"）。
-4. **FunASR 侧状态持续累积** — `audio_buffer`/`locked_sentences` 不断增长，已解码文本还会作为后续解码上下文。服务端已有 `reset()` 方法（`deploy/funasr/segment-end.patch:53-59`）只是没挂成命令；要用需补丁加 `RESET` 分支 + Go 侧实现 `FunASRASR.Reset()`。注意 `publishSentence` 去重键为 `"<start>:<end>:<text>"` 且 `seen` map 从不清理，服务端 reset 后时间戳归零会吞掉合法重复；`seen` 无锁、由 readLoop 独占，只能在 readLoop 观察到 `reset` 事件时清理。
+4. **FunASR 侧状态持续累积** — `audio_buffer`/`locked_sentences` 不断增长，已解码文本还会作为后续解码上下文。外部 FunASR 服务已有 `reset()` 方法，但当前 `external-vad.patch` 未增加 `RESET` 协议分支；要用需补丁加 `RESET` 分支 + Go 侧实现 `FunASRASR.Reset()`。注意 `publishSentence` 去重键为 `"<start>:<end>:<text>"` 且 `seen` map 从不清理，服务端 reset 后时间戳归零会吞掉合法重复；`seen` 无锁、由 readLoop 独占，只能在 readLoop 观察到 `reset` 事件时清理。
 5. **`GET /memories` 漏报最后一条** — 查看记忆请以数据库为准（见上）。
 6. **mem0 写入耗时随库大小增长** — 1 条时 4.5s，20 条时 >30s。当前靠放宽超时绕过，不是解决。
 7. **记忆注入无相关性阈值** — 固定 top 8 不看分数。分数普遍挤在 0.84–0.88，排序区分度低，噪声仍可能挤掉有用记忆。
 8. **`llmagent.Config.Description` 仍是英文** — 会进 system instruction。
 9. **`scripts/` 目录多个 `package main`** — `go test ./...` 报重复 main（既有问题）。
+
+---
+
+## Development Log: Silero VAD 单一断句权与 FunASR 长连接（2026-08-11）
+
+### 目标与结论
+
+语音输入的句子边界统一由本地 Silero VAD 决定，FunASR 仅负责在同一条 WebSocket 上持续接收已通过 Silero 门控的 PCM、返回 partial，并在收到 `SEGMENT_END` 时强制产出该句 final。整条麦克风会话结束时才发送 `STOP` 并关闭 ASR 连接。
+
+```text
+microphone PCM
+  -> Silero VAD（门控、预滚、350 ms 静音切句、15 s 强切）
+  -> long-lived FunASR WebSocket
+  -> VADEnd / max-speech => SEGMENT_END
+  -> FunASR final transcript
+  -> ADK runner（memory / tools / session / LLM）
+  -> LLM text stream -> TTS stream -> client audio
+```
+
+因此，一个客户端 WebSocket 对应一个 `VoiceSession` 和一条 FunASR WebSocket；一句话结束不会新建或关闭 FunASR 连接。`VAD_MAX_SPEECH_MS=15000` 也会产生 `VADEnd`，走同一条 `SEGMENT_END` 路径。
+
+### 修复的双 VAD 问题
+
+此前文档和 Go 调度已经按上述协议工作，但 FunASR 服务端在 `SEGMENT_END` 时仍读取内部 FSMN-VAD 的 `current_speech_start`。这意味着内部 VAD 仍是隐式的第二个断句状态来源：Silero 已经切句而 FSMN-VAD 未进入 speech 状态时，强制解码可能没有有效音频范围，表现为说话后偶发不识别。
+
+FunASR 增加独立的 `--external-vad` 模式：
+
+- 首个由 Silero 放行的 PCM 记录 `segment_start_sample`。
+- `add_audio` 在该模式下不调用 FSMN-VAD。
+- `SEGMENT_END` 解码 `[segment_start_sample, current_end]`，完成后仅重置当前外部句子状态，WebSocket 保持连接。
+- `STOP` 只在整条麦克风会话结束时收尾当前未结束片段并结束任务。
+- 外部模式不加载 FSMN-VAD 模型，启动日志应包含 `External VAD mode: FSMN-VAD disabled`。
+
+外部服务代码不纳入本仓库；可复现补丁位于 `deploy/funasr/external-vad.patch`，启动器 `deploy/funasr/run-funasr-nano.sh` 会针对 Fun-ASR 基线提交 `3f95db6` 自动应用该补丁并传入 `--external-vad`。补丁已在干净 worktree 中通过 `git apply --check`、应用和 `git diff --check` 验证。
+
+### 额外稳定性修复
+
+ASR 连接被对端关闭时，API 路径可能显式调用 `VoiceSession.Close()`，随后 defer 再调用一次。旧实现只让 `closed` channel 的关闭幂等，但仍会重复调用 `s.vad.Close()`；Silero ONNX session 的 `Destroy` 不可重复执行，会触发 Cgo `SIGSEGV`。
+
+`VoiceSession.Close()` 现将完整的资源清理（取消 turn、TTS、VAD、ASR）纳入同一个 `sync.Once`，并缓存第一次的错误。新增 `TestVoiceSessionCloseReleasesResourcesOnce`，覆盖两次 `Close()` 后 VAD 和 ASR 各只关闭一次。
+
+### 验证
+
+- FunASR 外部 VAD 状态机测试通过：连续两个 `SEGMENT_END` 都能产出 final，且不访问内部 VAD 状态。
+- `python -m py_compile /data/liuxin/Fun-ASR/serve_realtime_ws.py` 通过。
+- `go test ./internal/voice ./internal/tts` 通过。
+- `go build -o server ./cmd/server` 通过。
+- 端到端命令：
+
+  ```bash
+  go run scripts/test_vad_funasr_e2e.go internal/vad/testdata/test2.wav
+  ```
+
+  同一条 FunASR WebSocket 收到 3 个 Silero 边界并返回 3 句 final：
+
+  1. `一二三四五六七，七六五四三二一。`，79 ms
+  2. `你好，你好。`，57 ms
+  3. `今天天气怎么样？`，102 ms
+
+  随后的 `STOP` 返回 stopped，证明句间没有重连、会话结束才关闭。
+
+### LLM / TTS 直连（2026-08-11）
+
+主服务仍保留 `http_proxy` / `https_proxy` 供其他外部依赖使用，但 `NO_PROXY` 和 `no_proxy` 增加了 `ark.cn-beijing.volces.com` 与 `openspeech.bytedance.com`。因此豆包 Ark LLM 的 HTTPS 和豆包 TTS 的 WSS 均直连，不经 `127.0.0.1:8118`；本地 FunASR 已在 localhost 排除项内。此前一次 `TLS handshake timeout` 发生在 LLM 经 8118 建连时，调整后不再依赖该代理链路。
+
+### Silero VAD 概率遥测（2026-08-11）
+
+实时客户端曾出现“音频持续上行但没有 ASR final”。已有探针只能说明 PCM 峰值和 RMS，无法区分“Silero 概率始终低于阈值”与“VAD 状态机未起段”。`vad.AudioOutput` 现携带每次处理的推理帧数及概率区间，`VoiceSession` 每 100 个客户端块（约 20 秒）记录 `vad_frames`、`vad_probability_min`、`vad_probability_max`，不保存或输出音频内容。新增 `TestAudioGateReportsInferenceProbabilityRange` 锁定该统计。
+
+该遥测用于依据真实概率决定是否调整 `VAD_THRESHOLD`，避免仅凭 PCM 振幅盲目降低阈值而引入回声/噪声误触发。
+
+### 长 TTS 的打断队列修复（2026-08-11）
+
+**根因**：WebSocket 写泵原来将 `tts_audio` 与 `interrupt` 放入同一个容量 256 的 FIFO。大段 TTS 生成速度快于本地播放时，`interrupt` 会排在数秒旧 PCM 后；即使服务端已取消 turn，客户端也只能继续接收、排队和播放旧音频。客户端播放器本身也是无界 deque，已经到达客户端的 PCM 不能由服务端撤回。
+
+**修复**：
+
+- `internal/api/server.go` 把输出拆分为普通消息、按序媒体、优先控制三路。`interrupt` 与 `tts_error` 走控制通道；写泵发送控制前清空尚未发送的媒体队列。`tts_end` 保持在媒体队列尾部，仍严格位于该 turn 的音频之后。
+- 客户端在收到 `interrupt` 时继续清空本地待播队列。曾尝试对正常播放队列设定 800 ms 硬上限，但 TTS 服务会短时突发发送，丢弃最旧 PCM 会造成朗读缺字，已撤回；正常播放不得主动丢帧。
+
+服务端新增 `TestDiscardQueuedVoiceMedia`；API、voice、VAD 测试和服务端构建均通过，客户端已通过 `python3 -m py_compile client/voice_client.py`。实际客户端部署在另一台机器时，需要同步客户端修改以获得 `interrupt` 的即时清队列行为。
+
+### 当前部署状态
+
+- FunASR：`funasr-nano-external-vad.service`，以 `--external-vad` 运行在 `127.0.0.1:10095`。
+- 主服务：`xin-chat-robot-agent.service`。
+- 本次主服务二进制已重建；完成服务重启后，客户端需重新建立 WebSocket 连接。
+
+### 当日改动清单（2026-08-11）
+
+**本仓库：**
+
+- `internal/voice/session.go`：TTS 文本分段从 24 调整为 12 个 rune；关闭路径改为完整资源清理的幂等 `sync.Once`；每 20 秒记录 Silero 推理帧数和概率范围。
+- `internal/vad/{types,audio_gate}.go`：将每个输入块的 Silero 推理帧数、最小概率、最大概率传递给会话遥测；对应单元测试已补充。
+- `internal/api/server.go`：WebSocket 输出拆为普通消息、媒体、控制三条队列；`interrupt`/`tts_error` 优先发送并清除尚未写出的旧 TTS PCM。`TestDiscardQueuedVoiceMedia` 覆盖该行为。
+- `internal/tts/{text_chunker,llm_tts_real_test}.go`：默认 TTS 输入块改为 12 个 rune，标点仍可提前切分。
+- `.env.example`：Ark LLM 和豆包 TTS 域名加入 `NO_PROXY`/`no_proxy`；示例 Silero 阈值改为 `0.4`。当前实际 `.env` 同样为 `VAD_THRESHOLD=0.4`、`VAD_MIN_SPEECH_MS=250`、`VAD_MIN_SILENCE_MS=350`。
+- `test/session_context_load.go` 与 `SESSION_CONTEXT_LOAD_REPORT.md`：新增隔离的 PostgreSQL 上下文负载验证。550 个语义 turn / 1,100 个 ADK event 下，`conversation_load_context` p95 为 1.03 ms、`adk_session_get` p95 为 4.37 ms；读取边界保持在 12 个语义 turn 和 48 个 ADK event。
+- `README.md`、`deploy/funasr/README.md`：同步为“Silero 负责断句，FunASR 长连接按 `SEGMENT_END` final”的实际协议。
+
+**仓库外 FunASR 依赖：**
+
+- 外部工作树：`/data/liuxin/Fun-ASR/serve_realtime_ws.py`，相对上游当前为 75 行新增、16 行修改；可复现副本为本仓库的 `deploy/funasr/external-vad.patch`。
+- 增加 `--external-vad`。启用时不加载、不实例化、不读取 FSMN-VAD；首个 Silero 放行帧记录 `segment_start_sample`，普通 decode 仅给当前外部段返回 partial，`SEGMENT_END` 解码该段并保留 WebSocket 供下一句复用，`STOP` 才结束整个会话。
+- `deploy/funasr/run-funasr-nano.sh` 固定应用该补丁并以 `--external-vad` 启动，无法匹配 FunASR 的 `SEGMENT_END` 基线时失败退出，避免悄然退回双 VAD。
+- 当前 transient service：`funasr-nano-external-vad.service`，命令参数包括 `--external-vad`、`--decode-interval 0.8`、`--gpu-memory-utilization 0.6`、监听 `127.0.0.1:10095`。外部工作树另有 `.venv/` 与 `funasr.log`，不是源代码改动。
+
+**验证与限制：**
+
+- 已通过：FunASR 外部 VAD 状态机、`python -m py_compile /data/liuxin/Fun-ASR/serve_realtime_ws.py`、相关 Go 单测、服务端构建和同一条 ASR WebSocket 的三句 E2E。
+- 长 TTS 后的漏识别已从日志确认是部分人声 Silero 概率低于 `0.5`，阈值已降为 `0.4` 并重启主服务；需要重新连接客户端后验证实际效果。
+- 外放环境缺少 AEC 时，TTS 回声与用户人声仍无法可靠分离；这不是本次阈值和队列修复可以根治的问题。

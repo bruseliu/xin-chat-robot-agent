@@ -138,8 +138,32 @@ func TestVoiceSessionRunsTextTurnOnFinalAudio(t *testing.T) {
 	}
 }
 
+func TestVoiceSessionCloseReleasesResourcesOnce(t *testing.T) {
+	pipeline := NewPipeline(&fakeRunner{}, nil, slog.Default())
+	processor := &fakeVoiceVAD{}
+	asr := &fakeStreamingASR{}
+	session, err := NewVoiceSession(pipeline, processor, asr, VoiceSessionConfig{UserID: "alice", SessionID: "s1"})
+	if err != nil {
+		t.Fatalf("NewVoiceSession() error = %v", err)
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+	if processor.closes != 1 {
+		t.Fatalf("VAD closes = %d, want 1", processor.closes)
+	}
+	if asr.closes != 1 {
+		t.Fatalf("ASR closes = %d, want 1", asr.closes)
+	}
+}
+
 type fakeVoiceVAD struct {
-	out vad.AudioOutput
+	out    vad.AudioOutput
+	closes int
 }
 
 func (f *fakeVoiceVAD) Process(context.Context, vad.Chunk) (vad.AudioOutput, error) {
@@ -147,12 +171,16 @@ func (f *fakeVoiceVAD) Process(context.Context, vad.Chunk) (vad.AudioOutput, err
 }
 
 func (f *fakeVoiceVAD) Reset() error { return nil }
-func (f *fakeVoiceVAD) Close() error { return nil }
+func (f *fakeVoiceVAD) Close() error {
+	f.closes++
+	return nil
+}
 
 type fakeStreamingASR struct {
 	transcript Transcript
 	writes     int
 	finalizes  int
+	closes     int
 }
 
 func (f *fakeStreamingASR) Write(context.Context, vad.Chunk) error {
@@ -166,7 +194,10 @@ func (f *fakeStreamingASR) Finalize(context.Context) (Transcript, error) {
 }
 
 func (f *fakeStreamingASR) Reset() error { return nil }
-func (f *fakeStreamingASR) Close() error { return nil }
+func (f *fakeStreamingASR) Close() error {
+	f.closes++
+	return nil
+}
 
 type fakeRunner struct {
 	calls int

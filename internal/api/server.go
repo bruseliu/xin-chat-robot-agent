@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/gorilla/websocket"
 
@@ -24,6 +25,29 @@ type VADFactory func() (vad.AudioProcessor, error)
 type ASRFactory func(ctx context.Context) (voice.StreamingASR, error)
 
 type SessionCloseFunc func(ctx context.Context, userID, sessionID string)
+
+type voiceWSMessage struct {
+	msgType int
+	data    []byte
+}
+
+// discardQueuedVoiceMedia removes stale TTS PCM (and its trailing tts_end)
+// before an interrupt reaches the client. The media queue is intentionally
+// separate from normal JSON messages, so no new turn metadata is discarded.
+func discardQueuedVoiceMedia(media <-chan voiceWSMessage) int {
+	dropped := 0
+	for {
+		select {
+		case _, ok := <-media:
+			if !ok {
+				return dropped
+			}
+			dropped++
+		default:
+			return dropped
+		}
+	}
+}
 
 type Server struct {
 	httpServer     *http.Server
@@ -154,22 +178,48 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("voice websocket connected", "user_id", userID, "session_id", sessionID, "sample_rate", sampleRate, "remote_addr", r.RemoteAddr)
 
-	// Write pump: serializes all writes through one goroutine.
-	// Pong has a dedicated channel with priority over data frames.
-	type wsMsg struct {
-		msgType int
-		data    []byte
-	}
-	writeCh := make(chan wsMsg, 256)
-	pongCh := make(chan wsMsg, 4)
+	// Write pump: control frames must bypass queued TTS media. Otherwise a long
+	// reply can place an interrupt behind seconds of PCM that the client has
+	// already enqueued for playback.
+	messageCh := make(chan voiceWSMessage, 32)
+	mediaCh := make(chan voiceWSMessage, 256)
+	controlCh := make(chan voiceWSMessage, 1)
+	pongCh := make(chan voiceWSMessage, 4)
 	writeDone := make(chan struct{})
 	go func() {
 		defer close(writeDone)
-		for {
-			// Drain pong with priority
+		for messageCh != nil || mediaCh != nil || controlCh != nil {
+			// Pongs and interrupt/error controls preempt normal text and media.
 			select {
 			case msg := <-pongCh:
 				if msg.msgType == 0 {
+					continue
+				}
+				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
+					return
+				}
+				continue
+			default:
+			}
+			select {
+			case msg, ok := <-controlCh:
+				if !ok {
+					controlCh = nil
+					continue
+				}
+				if dropped := discardQueuedVoiceMedia(mediaCh); dropped > 0 {
+					s.logger.Info("discarded queued TTS frames before control", "frames", dropped)
+				}
+				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
+					return
+				}
+				continue
+			default:
+			}
+			select {
+			case msg, ok := <-messageCh:
+				if !ok {
+					messageCh = nil
 					continue
 				}
 				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
@@ -186,9 +236,29 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
 					return
 				}
-			case msg, ok := <-writeCh:
+			case msg, ok := <-controlCh:
 				if !ok {
+					controlCh = nil
+					continue
+				}
+				if dropped := discardQueuedVoiceMedia(mediaCh); dropped > 0 {
+					s.logger.Info("discarded queued TTS frames before control", "frames", dropped)
+				}
+				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
 					return
+				}
+			case msg, ok := <-messageCh:
+				if !ok {
+					messageCh = nil
+					continue
+				}
+				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
+					return
+				}
+			case msg, ok := <-mediaCh:
+				if !ok {
+					mediaCh = nil
+					continue
 				}
 				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
 					return
@@ -198,7 +268,7 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 	}()
 	conn.SetPingHandler(func(appData string) error {
 		select {
-		case pongCh <- wsMsg{msgType: websocket.PongMessage, data: []byte(appData)}:
+		case pongCh <- voiceWSMessage{msgType: websocket.PongMessage, data: []byte(appData)}:
 		default:
 		}
 		return nil
@@ -231,23 +301,38 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 	}
 	outputs := session.Outputs()
 	var writerDone chan struct{}
+	var closeQueues sync.Once
+	closeOutputQueues := func() {
+		closeQueues.Do(func() {
+			close(messageCh)
+			close(mediaCh)
+			close(controlCh)
+		})
+	}
 	if outputs != nil {
 		writerDone = make(chan struct{})
 		go func() {
 			defer close(writerDone)
+			defer closeOutputQueues()
 			for output := range outputs {
-				var msg wsMsg
+				var msg voiceWSMessage
 				if len(output.AudioPCM) > 0 {
-					msg = wsMsg{msgType: websocket.BinaryMessage, data: output.AudioPCM}
+					msg = voiceWSMessage{msgType: websocket.BinaryMessage, data: output.AudioPCM}
 				} else {
 					data, err := json.Marshal(output)
 					if err != nil {
 						return
 					}
-					msg = wsMsg{msgType: websocket.TextMessage, data: data}
+					msg = voiceWSMessage{msgType: websocket.TextMessage, data: data}
+				}
+				target := messageCh
+				if len(output.AudioPCM) > 0 || output.Type == "tts_end" {
+					target = mediaCh
+				} else if output.Type == "interrupt" || output.Type == "tts_error" {
+					target = controlCh
 				}
 				select {
-				case writeCh <- msg:
+				case target <- msg:
 				case <-writeDone:
 					return
 				}
@@ -260,13 +345,8 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 			<-writerDone
 			writerDone = nil
 		}
-		select {
-		case <-writeDone:
-		default:
-			close(writeCh)
-			close(pongCh)
-			<-writeDone
-		}
+		closeOutputQueues()
+		<-writeDone
 	}
 	defer closeSession()
 

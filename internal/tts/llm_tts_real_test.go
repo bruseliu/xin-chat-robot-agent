@@ -87,7 +87,7 @@ func TestDoubaoLLMToTTSRealStream(t *testing.T) {
 		},
 	}
 	var answer strings.Builder
-	textChunker := NewTextChunker(24)
+	textChunker := NewTextChunker(12)
 	ttsChunkCount := 0
 	deltaCount := 0
 	for response, streamErr := range llmStream.GenerateContent(ctx, request, true) {

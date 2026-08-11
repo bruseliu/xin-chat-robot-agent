@@ -52,6 +52,20 @@ func TestVoiceWebSocketRunsVoiceSession(t *testing.T) {
 	}
 }
 
+func TestDiscardQueuedVoiceMedia(t *testing.T) {
+	media := make(chan voiceWSMessage, 3)
+	media <- voiceWSMessage{msgType: websocket.BinaryMessage, data: []byte{1}}
+	media <- voiceWSMessage{msgType: websocket.BinaryMessage, data: []byte{2}}
+	media <- voiceWSMessage{msgType: websocket.TextMessage, data: []byte(`{"type":"tts_end"}`)}
+
+	if got := discardQueuedVoiceMedia(media); got != 3 {
+		t.Fatalf("discardQueuedVoiceMedia() = %d, want 3", got)
+	}
+	if len(media) != 0 {
+		t.Fatalf("media queue length = %d, want 0", len(media))
+	}
+}
+
 type apiFakeVAD struct {
 	out vad.AudioOutput
 }

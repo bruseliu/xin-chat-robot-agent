@@ -24,6 +24,24 @@ func TestAudioGateBuffersUntilWindow(t *testing.T) {
 	}
 }
 
+func TestAudioGateReportsInferenceProbabilityRange(t *testing.T) {
+	gate, err := NewAudioGate(&scriptedInferer{probs: []float32{0.25, 0.75}}, StreamConfig{SampleRate: 16000, Threshold: 0.5}, AudioGateConfig{})
+	if err != nil {
+		t.Fatalf("NewAudioGate() error = %v", err)
+	}
+
+	out, err := gate.Process(context.Background(), Chunk{Samples: make([]float32, 1024), SampleRate: 16000})
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if out.InferenceFrames != 2 {
+		t.Fatalf("InferenceFrames = %d, want 2", out.InferenceFrames)
+	}
+	if out.ProbabilityMin != 0.25 || out.ProbabilityMax != 0.75 {
+		t.Fatalf("probability range = [%v, %v], want [0.25, 0.75]", out.ProbabilityMin, out.ProbabilityMax)
+	}
+}
+
 func TestAudioGateReturnsPreRollOnSpeechStart(t *testing.T) {
 	inferer := &scriptedInferer{probs: scriptedProbs(27, 0, 0.8, 0.8)}
 	gate, err := NewAudioGate(inferer, StreamConfig{

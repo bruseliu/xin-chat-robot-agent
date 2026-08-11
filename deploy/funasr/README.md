@@ -7,6 +7,10 @@ real-time WebSocket protocol used by this service and fits the available RTX
 Keep the ASR service private. The application connects to it through
 `ws://127.0.0.1:10095` by default.
 
+The deployment patch is based on Fun-ASR commit `3f95db6`, which already includes
+`SEGMENT_END`. The launcher applies only `external-vad.patch`; it fails fast for a
+different upstream source layout rather than silently starting with a second VAD.
+
 ## Install the Service
 
 Clone the upstream service outside this repository, then create a Python
@@ -45,16 +49,19 @@ CUDA toolkit and a reason to use that sampler.
 ## Application Settings
 
 ```env
-VAD_PROVIDER=passthrough
+VAD_PROVIDER=silero
 ASR_PROVIDER=funasr
 FUNASR_URL=ws://127.0.0.1:10095
 FUNASR_SAMPLE_RATE=16000
 FUNASR_TIMEOUT_SECONDS=30
 ```
 
-The FunASR service accepts PCM16LE mono 16 kHz frames. It handles endpointing
-itself, so the application forwards both speech and silence. Each locked
-FunASR sentence triggers one text turn while the WebSocket stays open.
+The FunASR service accepts PCM16LE mono 16 kHz frames. In the selected hybrid
+path, Silero VAD is the utterance-boundary authority: the application forwards
+only speech frames, sends `SEGMENT_END` on every local `VADEnd`, and keeps the
+same WebSocket open for the next utterance. FunASR force-decodes that segment
+and returns a locked sentence, which triggers one text turn. `STOP` is sent
+only when the whole microphone session ends.
 
 For manual local WebSocket tests from a shell that configures an HTTP proxy,
 set `NO_PROXY=127.0.0.1,localhost` (and `no_proxy` if needed) so the local ASR

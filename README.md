@@ -38,7 +38,7 @@ client audio stream
       -> client audio
 ```
 
-`internal/voice.VoiceSession` owns one VAD processor and ASR stream per client connection. Legacy providers keep the local VAD-gated segment path. With `ASR_PROVIDER=funasr` and `VAD_PROVIDER=passthrough`, the full PCM stream, including silence, goes to the private Fun-ASR-Nano WebSocket service. Each locked provider sentence starts one ADK text turn without closing the ASR connection; the client `final` control message sends `STOP` and waits for the final response.
+`internal/voice.VoiceSession` owns one VAD processor and ASR stream per client connection. The selected FunASR path uses Silero as the sentence-boundary authority: only local-VAD speech audio is written to the long-lived FunASR WebSocket, and every `VADEnd` sends `SEGMENT_END` to force-decode that utterance without closing the connection. Each returned sentence starts one ADK text turn. The client `final` control message sends `STOP` only when the entire microphone session ends.
 
 `GET /v1/chat/voice` is the current WebSocket entry point. It expects `user_id` and optional `session_id`/`sample_rate` query parameters. Binary messages are treated as PCM16LE audio chunks; a text control message `{"type":"final"}` flushes the current audio stream. When ASR returns a final transcript, the server responds with a JSON `VoiceTurnOutput`.
 
@@ -58,7 +58,7 @@ START -> turn_context -> memory_context -> llm -> memory_commit
 
 Node payloads use text-first envelopes (`TurnContext`, `LLMInput`, `LLMOutput`) with optional `AttachmentRef` values. Image memory is not implemented now, but future image/audio/video blobs can be attached by reference without changing the reasoning graph shape.
 
-The selected ASR implementation is `internal/voice.FunASRASR`, a connection-scoped adapter for the private Fun-ASR-Nano real-time WebSocket service. It sends `START`, continuous PCM binary frames, maps locked `sentences[]` items to final user utterances, and sends `STOP` only when the client finishes the entire microphone stream. `AliyunNLSASR` and `DoubaoASR` remain available as cloud fallbacks.
+The selected ASR implementation is `internal/voice.FunASRASR`, a connection-scoped adapter for the private Fun-ASR-Nano real-time WebSocket service. It sends `START`, receives Silero-gated PCM frames, maps deduplicated `sentences[]` items to final user utterances, and sends `SEGMENT_END` at each local VAD boundary. It sends `STOP` only when the client finishes the entire microphone stream. `AliyunNLSASR` and `DoubaoASR` remain available as cloud fallbacks.
 
 The next concrete replacements are:
 
@@ -83,11 +83,11 @@ The repository carries ONNX Runtime v1.18.1 under `third_party/onnxruntime/linux
 Runtime configuration for the selected FunASR path:
 
 ```env
-VAD_PROVIDER=passthrough
+VAD_PROVIDER=silero
 SILERO_VAD_MODEL_PATH=models/silero-vad/silero_vad.onnx
 VAD_SAMPLE_RATE=16000
 VAD_THRESHOLD=0.5
-VAD_MIN_SILENCE_MS=200
+VAD_MIN_SILENCE_MS=350
 VAD_MIN_SPEECH_MS=250
 VAD_SPEECH_PAD_MS=30
 VAD_PRE_ROLL_MS=800
@@ -95,7 +95,7 @@ VAD_AUDIO_BUFFER_SECONDS=5
 VAD_MAX_SPEECH_MS=15000
 ```
 
-Set `VAD_PROVIDER=silero` only for the legacy local-VAD ASR path.
+For the selected FunASR path, keep `VAD_PROVIDER=silero`: it owns utterance boundaries and drives `SEGMENT_END`. `passthrough` is only for provider-owned endpointing experiments.
 
 ASR configuration:
 

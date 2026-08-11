@@ -103,6 +103,9 @@ func (g *AudioGate) Process(ctx context.Context, chunk Chunk) (AudioOutput, erro
 	var out []float32
 	vadStart := false
 	vadEnd := false
+	inferenceFrames := 0
+	probabilityMin := float32(1)
+	probabilityMax := float32(0)
 	for g.audio.End()-g.vadRead >= int64(g.windowSize) {
 		if err := ctx.Err(); err != nil {
 			return AudioOutput{}, err
@@ -111,6 +114,13 @@ func (g *AudioGate) Process(ctx context.Context, chunk Chunk) (AudioOutput, erro
 		probability, err := g.inferer.Infer(frame)
 		if err != nil {
 			return AudioOutput{}, fmt.Errorf("vad: infer frame: %w", err)
+		}
+		inferenceFrames++
+		if probability < probabilityMin {
+			probabilityMin = probability
+		}
+		if probability > probabilityMax {
+			probabilityMax = probability
 		}
 		g.vadRead += int64(g.windowSize)
 		started, ended := g.applyProbability(probability)
@@ -155,8 +165,11 @@ func (g *AudioGate) Process(ctx context.Context, chunk Chunk) (AudioOutput, erro
 			SampleRate: sampleRate,
 			Final:      chunk.Final,
 		},
-		VADEnd:   vadEnd,
-		VADStart: vadStart,
+		VADEnd:          vadEnd,
+		VADStart:        vadStart,
+		InferenceFrames: inferenceFrames,
+		ProbabilityMin:  probabilityMin,
+		ProbabilityMax:  probabilityMax,
 	}, nil
 }
 

@@ -39,7 +39,8 @@ type StreamingASR interface {
 	Close() error
 }
 
-// ServerEndpointingASR emits a final transcript for each provider-detected sentence.
+// ServerEndpointingASR emits a final transcript for each provider-confirmed
+// sentence while retaining the connection for the full microphone session.
 type ServerEndpointingASR interface {
 	StreamingASR
 	SentenceTranscripts() <-chan Transcript
@@ -47,8 +48,8 @@ type ServerEndpointingASR interface {
 }
 
 // SegmentEndNotifier is optionally implemented by ServerEndpointingASR providers
-// that support a "segment end" signal from the client's local VAD. The provider
-// force-decodes the current audio as a sentence without closing the connection.
+// that accept local VAD sentence boundaries. SEGMENT_END force-decodes the
+// current audio as a sentence without closing the microphone connection.
 type SegmentEndNotifier interface {
 	NotifySegmentEnd(ctx context.Context) error
 }
@@ -109,14 +110,18 @@ type VoiceSession struct {
 	// closed aborts a blocked emit during teardown, so Close() cannot deadlock
 	// against a transport writer that has already gone away.
 	closeOnce sync.Once
+	closeErr  error
 	closed    chan struct{}
 
 	// Ingest counters, owned by the ProcessAudio goroutine.
-	chunksIn       int64
-	speechChunksIn int64
-	inputPeak      float64
-	inputEnergy    float64
-	inputSamples   int64
+	chunksIn          int64
+	speechChunksIn    int64
+	inputPeak         float64
+	inputEnergy       float64
+	inputSamples      int64
+	vadFrames         int64
+	vadProbabilityMin float64
+	vadProbabilityMax float64
 }
 
 // audioProbeEveryChunks samples the ingest log. At the client's 200 ms frames
@@ -367,7 +372,7 @@ func (s *VoiceSession) runTextTurn(ctx context.Context, seq uint64, transcript T
 	var speechWriteErr error
 	wroteDelta := false
 	firstLLMDelta := false
-	textChunker := tts.NewTextChunker(24)
+	textChunker := tts.NewTextChunker(12)
 	startSpeech := func() error {
 		if speech != nil || s.cfg.TTSFactory == nil || s.outputs == nil {
 			return nil
@@ -530,14 +535,6 @@ func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (Voic
 	}
 	s.inputEnergy += energy
 	s.inputSamples += samples
-	if s.chunksIn%audioProbeEveryChunks == 0 {
-		inputRMS := 0.0
-		if s.inputSamples > 0 {
-			inputRMS = math.Sqrt(s.inputEnergy / float64(s.inputSamples))
-		}
-		s.logger.Info("audio ingest alive", "chunks", s.chunksIn, "speech_chunks", s.speechChunksIn, "turn_active", s.turnActive.Load(), "input_peak", s.inputPeak, "input_rms", inputRMS)
-		s.inputPeak, s.inputEnergy, s.inputSamples = 0, 0, 0
-	}
 	vadOut, err := s.vad.Process(ctx, vad.Chunk{
 		PCM16LE:    chunk.PCM16LE,
 		Samples:    chunk.Samples,
@@ -546,6 +543,24 @@ func (s *VoiceSession) ProcessAudio(ctx context.Context, chunk AudioChunk) (Voic
 	})
 	if err != nil {
 		return VoiceTurnOutput{}, err
+	}
+	if vadOut.InferenceFrames > 0 {
+		if s.vadFrames == 0 || float64(vadOut.ProbabilityMin) < s.vadProbabilityMin {
+			s.vadProbabilityMin = float64(vadOut.ProbabilityMin)
+		}
+		if s.vadFrames == 0 || float64(vadOut.ProbabilityMax) > s.vadProbabilityMax {
+			s.vadProbabilityMax = float64(vadOut.ProbabilityMax)
+		}
+		s.vadFrames += int64(vadOut.InferenceFrames)
+	}
+	if s.chunksIn%audioProbeEveryChunks == 0 {
+		inputRMS := 0.0
+		if s.inputSamples > 0 {
+			inputRMS = math.Sqrt(s.inputEnergy / float64(s.inputSamples))
+		}
+		s.logger.Info("audio ingest alive", "chunks", s.chunksIn, "speech_chunks", s.speechChunksIn, "turn_active", s.turnActive.Load(), "input_peak", s.inputPeak, "input_rms", inputRMS, "vad_frames", s.vadFrames, "vad_probability_min", s.vadProbabilityMin, "vad_probability_max", s.vadProbabilityMax)
+		s.inputPeak, s.inputEnergy, s.inputSamples = 0, 0, 0
+		s.vadFrames, s.vadProbabilityMin, s.vadProbabilityMax = 0, 0, 0
 	}
 	if vadOut.VADStart && s.cfg.BargeIn.Enabled && s.turnActive.Load() {
 		s.logger.Info("vad speech start detected, interrupting active turn")
@@ -670,14 +685,19 @@ func (s *VoiceSession) Close() error {
 	if s == nil {
 		return nil
 	}
+	s.closeOnce.Do(func() {
+		s.closeErr = s.closeResources()
+	})
+	return s.closeErr
+}
+
+func (s *VoiceSession) closeResources() error {
 	// Release any emit blocked on a transport writer that has already gone away,
 	// then cancel the in-flight turn so Close does not wait out a whole LLM+TTS
 	// round trip.
-	s.closeOnce.Do(func() {
-		if s.closed != nil {
-			close(s.closed)
-		}
-	})
+	if s.closed != nil {
+		close(s.closed)
+	}
 	s.interruptTurn("session_close", false)
 
 	var first error
