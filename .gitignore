@@ -7,6 +7,10 @@ dist/
 tmp/
 coverage.out
 
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
 # compiled server binary at repo root
 /server
 
