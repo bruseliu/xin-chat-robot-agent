@@ -1,0 +1,25 @@
+--- a/serve_realtime_ws.py
++++ b/serve_realtime_ws.py
+@@ -294,8 +294,9 @@
+             start_ms = int(self.segment_start_sample * 1000 / self.sample_rate)
+             end_ms = int(len(self.audio_buffer) * 1000 / self.sample_rate)
+             seg_text = self._decode_segment([start_ms, end_ms])
++            sentence = None
+             if seg_text.strip():
+-                self.locked_sentences.append({"text": seg_text, "start": start_ms, "end": end_ms})
++                sentence = {"text": seg_text, "start": start_ms, "end": end_ms}
+                 logger.info(f"ExternalSegmentEnd locked: [{start_ms}-{end_ms}ms] \"{seg_text[:40]}\"")
+ 
+             self.segment_start_sample = None
+@@ -303,7 +304,10 @@
+             self.last_partial_text = ""
+             self.first_decode_done = False
+             self.last_decode_samples = len(self.audio_buffer)
+-            return self._build_response(is_final=False)
++            response = self._build_response(is_final=False)
++            response["sentences"] = [sentence] if sentence else []
++            self.reset()
++            return response
+ 
+         if self.vad.current_speech_start is None:
+             return self._build_response(is_final=False)

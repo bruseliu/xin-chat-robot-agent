@@ -1,5 +1,5 @@
 diff --git a/serve_realtime_ws.py b/serve_realtime_ws.py
-index ed817ab..62d9df2 100644
+index ed817ab..4954dc0 100644
 --- a/serve_realtime_ws.py
 +++ b/serve_realtime_ws.py
 @@ -226,10 +226,11 @@ class HybridSpeakerTracker:
@@ -44,7 +44,7 @@ index ed817ab..62d9df2 100644
          new_audio = self.audio_buffer[self.vad_fed_samples:]
          if len(new_audio) > 0:
              new_confirmed = self.vad.feed(torch.from_numpy(new_audio).float(), is_final=False)
-@@ -272,12 +285,64 @@ class RealtimeASRSession:
+@@ -272,12 +285,68 @@ class RealtimeASRSession:
          threshold = self.first_chunk_samples if not self.first_decode_done else self.chunk_samples
          return (len(self.audio_buffer) - self.last_decode_samples) >= threshold
  
@@ -57,8 +57,9 @@ index ed817ab..62d9df2 100644
 +            start_ms = int(self.segment_start_sample * 1000 / self.sample_rate)
 +            end_ms = int(len(self.audio_buffer) * 1000 / self.sample_rate)
 +            seg_text = self._decode_segment([start_ms, end_ms])
++            sentence = None
 +            if seg_text.strip():
-+                self.locked_sentences.append({"text": seg_text, "start": start_ms, "end": end_ms})
++                sentence = {"text": seg_text, "start": start_ms, "end": end_ms}
 +                logger.info(f"ExternalSegmentEnd locked: [{start_ms}-{end_ms}ms] \"{seg_text[:40]}\"")
 +
 +            self.segment_start_sample = None
@@ -66,7 +67,10 @@ index ed817ab..62d9df2 100644
 +            self.last_partial_text = ""
 +            self.first_decode_done = False
 +            self.last_decode_samples = len(self.audio_buffer)
-+            return self._build_response(is_final=False)
++            response = self._build_response(is_final=False)
++            response["sentences"] = [sentence] if sentence else []
++            self.reset()
++            return response
 +
 +        if self.vad.current_speech_start is None:
 +            return self._build_response(is_final=False)
@@ -110,7 +114,7 @@ index ed817ab..62d9df2 100644
              remaining = self.audio_buffer[self.vad_fed_samples:]
              if len(remaining) > 0:
                  new_confirmed = self.vad.feed(torch.from_numpy(remaining).float(), is_final=True)
-@@ -300,7 +365,14 @@ class RealtimeASRSession:
+@@ -300,7 +369,14 @@ class RealtimeASRSession:
                  self.locked_sentences = self.spk_tracker.finalize(self.locked_sentences)
              return self._build_response(is_final)
  
@@ -126,7 +130,7 @@ index ed817ab..62d9df2 100644
              seg_start_sample = int(self.vad.current_speech_start * self.sample_rate / 1000)
              seg_audio = self.audio_buffer[seg_start_sample:]
          else:
-@@ -371,7 +443,11 @@ class RealtimeASRSession:
+@@ -371,7 +447,11 @@ class RealtimeASRSession:
          duration_ms = int(len(self.audio_buffer) * 1000 / self.sample_rate)
          sentences = list(self.locked_sentences)
          partial = self.last_partial_text
@@ -139,7 +143,7 @@ index ed817ab..62d9df2 100644
  
          if is_final:
              return {"sentences": sentences, "partial": "", "partial_start_ms": 0,
-@@ -384,11 +460,14 @@ class RealtimeASRSession:
+@@ -384,11 +464,14 @@ class RealtimeASRSession:
          self.audio_buffer = np.array([], dtype=np.float32)
          self.vad_fed_samples = 0
          self.first_decode_done = False
@@ -155,7 +159,7 @@ index ed817ab..62d9df2 100644
          if self.spk_tracker:
              self.spk_tracker.reset()
  
-@@ -426,8 +505,12 @@ def load_models(args):
+@@ -426,8 +509,12 @@ def load_models(args):
              _asr_kwargs["language"] = args.language
              logger.info(f"Language: {args.language}")
  
@@ -170,7 +174,7 @@ index ed817ab..62d9df2 100644
  
          if getattr(args, "disable_spk", False):
              logger.info("SPK disabled by --disable-spk")
-@@ -442,9 +525,9 @@ def load_models(args):
+@@ -442,9 +529,9 @@ def load_models(args):
  
  async def handle_client(websocket, args):
      vllm_engine, asr_kwargs, vad_model, spk_model = load_models(args)
@@ -182,7 +186,7 @@ index ed817ab..62d9df2 100644
      logger.info(f"Client connected: {websocket.remote_address}")
  
      decode_interval = args.decode_interval
-@@ -479,6 +562,11 @@ async def handle_client(websocket, args):
+@@ -479,6 +566,11 @@ async def handle_client(websocket, args):
                          logger.info(f"Final: {len(result['sentences'])} sentences")
                          session.is_active = False
                      await websocket.send(json.dumps({"event": "stopped"}))
@@ -194,7 +198,7 @@ index ed817ab..62d9df2 100644
              elif isinstance(message, bytes) and session.is_active:
                  await asyncio.to_thread(session.add_audio, message)
                  now = time.time()
-@@ -508,11 +596,12 @@ def build_websocket_serve_kwargs(args):
+@@ -508,11 +600,12 @@ def build_websocket_serve_kwargs(args):
  
  async def main(args):
      load_models(args)
@@ -209,7 +213,7 @@ index ed817ab..62d9df2 100644
          **serve_kwargs,
      ):
          await asyncio.Future()
-@@ -542,5 +631,7 @@ if __name__ == "__main__":
+@@ -542,5 +635,7 @@ if __name__ == "__main__":
      parser.add_argument("--tensor-parallel-size", type=int, default=1)
      parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
      parser.add_argument("--max-model-len", type=int, default=2048)

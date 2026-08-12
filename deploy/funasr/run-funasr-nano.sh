@@ -5,9 +5,11 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 patch_file="$script_dir/external-vad.patch"
+reset_patch_file="$script_dir/per-segment-reset.patch"
 
-if grep -q "External VAD mode: FSMN-VAD disabled" "$FUNASR_HOME/serve_realtime_ws.py" \
-  && grep -q -- "--external-vad" "$FUNASR_HOME/serve_realtime_ws.py"; then
+# Current protocol: each SEGMENT_END returns one new final sentence and then
+# resets the per-segment ASR state without reconnecting the WebSocket.
+if grep -Fq 'response["sentences"] = [sentence] if sentence else []' "$FUNASR_HOME/serve_realtime_ws.py"; then
   :
 elif git -C "$FUNASR_HOME" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
   :
@@ -17,12 +19,21 @@ elif git -C "$FUNASR_HOME" apply --check "$patch_file" >/dev/null 2>&1; then
     exit 1
   fi
   git -C "$FUNASR_HOME" apply "$patch_file"
+elif git -C "$FUNASR_HOME" apply --check "$reset_patch_file" >/dev/null 2>&1; then
+  if [[ "${FUNASR_APPLY_PATCH:-0}" != "1" ]]; then
+    printf "%s\n" "per-segment-reset.patch is not applied to $FUNASR_HOME. Inspect the diff, then restart with FUNASR_APPLY_PATCH=1 to apply it." >&2
+    exit 1
+  fi
+  git -C "$FUNASR_HOME" apply "$reset_patch_file"
 else
-  printf "%s\n" "external-vad.patch requires the documented FunASR baseline in $FUNASR_HOME/serve_realtime_ws.py" >&2
+  printf "%s\n" "FunASR source in $FUNASR_HOME matches neither the documented baseline nor a supported external-VAD patch level" >&2
   exit 1
 fi
-
 export FUNASR_BIND_HOST="${FUNASR_BIND_HOST:-127.0.0.1}"
+if [[ "${FUNASR_PATCH_ONLY:-0}" == "1" ]]; then
+  exit 0
+fi
+
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
 exec "${FUNASR_PYTHON:-python3}" "$FUNASR_HOME/serve_realtime_ws.py" \

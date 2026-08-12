@@ -2,6 +2,7 @@ package voice
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -67,11 +68,8 @@ func TestFunASRASRStreamingLifecycle(t *testing.T) {
 			return
 		}
 		if err := conn.WriteJSON(map[string]any{
-			"sentences": []map[string]any{
-				{"text": "第一句", "start": 0, "end": 800},
-				{"text": "第二句", "start": 900, "end": 1500},
-			},
-			"is_final": true,
+			"sentences": []map[string]any{{"text": "第二句", "start": 0, "end": 600}},
+			"is_final":  true,
 		}); err != nil {
 			t.Errorf("WriteJSON(final) error = %v", err)
 			return
@@ -114,6 +112,22 @@ func TestFunASRASRStreamingLifecycle(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("test server did not complete")
+	}
+}
+
+func TestFunASRASRPublishesRepeatedSegmentTimes(t *testing.T) {
+	stream := &FunASRASR{
+		logger:    slog.Default(),
+		sentences: make(chan Transcript, 2),
+	}
+	sentence := funASRSentence{Text: "你好", Start: 0, End: 800}
+	stream.publishSentence(sentence)
+	stream.publishSentence(sentence)
+
+	for i := 0; i < 2; i++ {
+		if transcript := mustReceiveFunASRSentence(t, stream.SentenceTranscripts()); transcript.Text != "你好" || !transcript.IsFinal {
+			t.Fatalf("sentence %d = %+v", i+1, transcript)
+		}
 	}
 }
 

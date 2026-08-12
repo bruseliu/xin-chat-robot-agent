@@ -1845,7 +1845,7 @@ PGPASSWORD=mem0pass psql -h 127.0.0.1 -U mem0 -d mem0 -tAc \
 1. **无 AEC 则 barge-in 与外放不可兼得** — 播放期麦克风信号在物理上无法区分"用户说话"和"自己的 TTS 绕回"。外放需 AEC，或把 `BARGE_IN_ENABLED` 与客户端 `MIC_MUTE_DURING_TTS` 一起翻回半双工。
 2. **打断即时性受限于句末检测** — 约 300ms（静音 200ms + 解码 ~80ms）。要做说话即时压低需给 `vad.AudioOutput` 加 `SpeechStarted`（`audio_gate.go` 已算出该状态，只是没暴露），但无 AEC 时会被回声频繁误触发。
 3. **被打断的 turn 不写 mem0** — `HandleTextTurnStream` 在 `writer.Enqueue` 之前就因 error 返回，而 ADK session 里可能已存用户消息 + 部分助手回复。行为与改动前一致，未改动；**半写事件正是 `sessionstore` 两次 off-by-one 的形状，值得专门 E2E 复验**（打断后问"我刚才说了什么"）。
-4. **FunASR 侧状态持续累积** — `audio_buffer`/`locked_sentences` 不断增长，已解码文本还会作为后续解码上下文。外部 FunASR 服务已有 `reset()` 方法，但当前 `external-vad.patch` 未增加 `RESET` 协议分支；要用需补丁加 `RESET` 分支 + Go 侧实现 `FunASRASR.Reset()`。注意 `publishSentence` 去重键为 `"<start>:<end>:<text>"` 且 `seen` map 从不清理，服务端 reset 后时间戳归零会吞掉合法重复；`seen` 无锁、由 readLoop 独占，只能在 readLoop 观察到 `reset` 事件时清理。
+4. **FunASR 每句状态重置** — 已于 2026-08-12 实现：外部 VAD 的 `SEGMENT_END` 只返回本句 final，随后清空音频缓冲和句子状态，WebSocket 保持连接；Go 侧已删除历史 `seen` 去重。
 5. **`GET /memories` 漏报最后一条** — 查看记忆请以数据库为准（见上）。
 6. **mem0 写入耗时随库大小增长** — 1 条时 4.5s，20 条时 >30s。当前靠放宽超时绕过，不是解决。
 7. **记忆注入无相关性阈值** — 固定 top 8 不看分数。分数普遍挤在 0.84–0.88，排序区分度低，噪声仍可能挤掉有用记忆。
@@ -1963,3 +1963,31 @@ ASR 连接被对端关闭时，API 路径可能显式调用 `VoiceSession.Close(
 - 已通过：FunASR 外部 VAD 状态机、`python -m py_compile /data/liuxin/Fun-ASR/serve_realtime_ws.py`、相关 Go 单测、服务端构建和同一条 ASR WebSocket 的三句 E2E。
 - 长 TTS 后的漏识别已从日志确认是部分人声 Silero 概率低于 `0.5`，阈值已降为 `0.4` 并重启主服务；需要重新连接客户端后验证实际效果。
 - 外放环境缺少 AEC 时，TTS 回声与用户人声仍无法可靠分离；这不是本次阈值和队列修复可以根治的问题。
+
+
+## Development Log: Per-Segment FunASR State Reset (2026-08-12)
+
+The external-VAD protocol now treats every `SEGMENT_END` as a complete ASR
+segment lifecycle while keeping the WebSocket and loaded model alive:
+
+```text
+Silero VADEnd -> SEGMENT_END -> decode current segment -> return one final
+-> reset per-segment ASR state -> accept the next segment on the same socket
+```
+
+- `RealtimeASRSession.force_segment_end()` in `deploy/funasr/external-vad.patch`
+  constructs its response before calling `reset()`. The response contains only
+  the newly decoded sentence; `audio_buffer`, `locked_sentences`, partial state,
+  and per-segment timestamps are then cleared.
+- No model reload or WebSocket reconnect occurs between utterances.
+- `deploy/funasr/per-segment-reset.patch` upgrades an already applied prior
+  external-VAD patch; the launcher recognizes that state and requires the same
+  explicit `FUNASR_APPLY_PATCH=1` opt-in before modifying it.
+- `internal/voice/FunASRASR` no longer keeps a client-side `seen` map. Each
+  `segment_end` response is authoritative and contains only new final output,
+  so repeated utterances with the same text and relative timestamps are valid.
+- `TestFunASRASRPublishesRepeatedSegmentTimes` covers that reset-safe behavior.
+
+This keeps the FunASR service memory and response size bounded for a long-lived
+microphone session. Speaker diarization remains disabled; enabling cross-segment
+speaker identity in the future requires preserving that state separately.

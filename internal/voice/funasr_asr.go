@@ -42,7 +42,6 @@ type FunASRASR struct {
 	sentences chan Transcript
 	partials  chan Transcript
 	completed chan error
-	seen      map[string]struct{}
 }
 
 var _ StreamingASR = (*FunASRASR)(nil)
@@ -76,7 +75,6 @@ func NewFunASRASR(ctx context.Context, cfg FunASRASRConfig, logger *slog.Logger)
 		sentences: make(chan Transcript, 32),
 		partials:  make(chan Transcript, 16),
 		completed: make(chan error, 1),
-		seen:      make(map[string]struct{}),
 	}
 	if err := stream.writeMessage(ctx, websocket.TextMessage, []byte("START")); err != nil {
 		_ = conn.Close()
@@ -293,11 +291,6 @@ func (s *FunASRASR) publishSentence(sentence funASRSentence) {
 	if text == "" {
 		return
 	}
-	key := fmt.Sprintf("%d:%d:%s", sentence.Start, sentence.End, text)
-	if _, seen := s.seen[key]; seen {
-		return
-	}
-	s.seen[key] = struct{}{}
 	s.logger.Info("funasr sentence", "text", text, "start_ms", sentence.Start, "end_ms", sentence.End)
 	transcript := Transcript{Text: text, IsFinal: true}
 	s.updateLatest(transcript)
@@ -390,8 +383,9 @@ type funASRResponse struct {
 	Partial   string           `json:"partial"`
 	IsFinal   bool             `json:"is_final"`
 	Error     string           `json:"error"`
-	// segment_end event is handled like a normal decode response —
-	// sentences in the payload are published normally.
+	// The external-VAD deployment returns only the newly finalized sentence for
+	// each segment_end response, so no client-side historical deduplication is
+	// needed.
 }
 
 type funASRSentence struct {
