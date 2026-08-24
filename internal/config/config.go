@@ -18,6 +18,7 @@ type Config struct {
 	ASR       ASRConfig
 	TTS       TTSConfig
 	BargeIn   BargeInConfig
+	Vision    VisionConfig
 }
 
 // BargeInConfig controls whether a new utterance interrupts the reply in
@@ -59,15 +60,24 @@ type Mem0Config struct {
 }
 
 type LLMConfig struct {
-	Provider       string
-	GeminiAPIKey   string
-	GeminiModel    string
-	DoubaoBaseURL  string
-	DoubaoAPIKey   string
-	DoubaoModel    string
-	DoubaoTimeout  time.Duration
-	DoubaoThinking string
-	Instruction    string
+	Provider          string
+	GeminiAPIKey      string
+	GeminiModel       string
+	DoubaoBaseURL     string
+	DoubaoAPIKey      string
+	DoubaoModel       string
+	DoubaoVisionModel string
+	DoubaoTimeout     time.Duration
+	DoubaoThinking    string
+	Instruction       string
+}
+
+type VisionConfig struct {
+	Enabled       bool
+	MaxFrameBytes int
+	MaxWidth      int
+	MaxHeight     int
+	MaxAge        time.Duration
 }
 
 type TTSConfig struct {
@@ -152,13 +162,14 @@ func Load() Config {
 			WriteTimeout: time.Duration(envInt("MEM0_WRITE_TIMEOUT_SECONDS", 60)) * time.Second,
 		},
 		LLM: LLMConfig{
-			Provider:      envString("LLM_PROVIDER", "none"),
-			GeminiAPIKey:  envString("GEMINI_API_KEY", envString("GOOGLE_API_KEY", "")),
-			GeminiModel:   envString("GEMINI_MODEL", "gemini-flash-latest"),
-			DoubaoBaseURL: envString("DOUBAO_LLM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"),
-			DoubaoAPIKey:  envString("DOUBAO_LLM_API_KEY", envString("ARK_API_KEY", "")),
-			DoubaoModel:   envString("DOUBAO_LLM_MODEL", ""),
-			DoubaoTimeout: time.Duration(envInt("DOUBAO_LLM_TIMEOUT_SECONDS", 60)) * time.Second,
+			Provider:          envString("LLM_PROVIDER", "none"),
+			GeminiAPIKey:      envString("GEMINI_API_KEY", envString("GOOGLE_API_KEY", "")),
+			GeminiModel:       envString("GEMINI_MODEL", "gemini-flash-latest"),
+			DoubaoBaseURL:     envString("DOUBAO_LLM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"),
+			DoubaoAPIKey:      envString("DOUBAO_LLM_API_KEY", envString("ARK_API_KEY", "")),
+			DoubaoModel:       envString("DOUBAO_LLM_MODEL", ""),
+			DoubaoVisionModel: envString("DOUBAO_VISION_MODEL", ""),
+			DoubaoTimeout:     time.Duration(envInt("DOUBAO_LLM_TIMEOUT_SECONDS", 60)) * time.Second,
 			// Reasoning models emit thinking tokens before any answer content,
 			// costing seconds of first-token latency. Voice needs it off.
 			DoubaoThinking: envString("DOUBAO_LLM_THINKING", "disabled"),

@@ -18,6 +18,7 @@ import (
 	"xin-chat-robot-agent/internal/memory"
 	"xin-chat-robot-agent/internal/sessionstore"
 	"xin-chat-robot-agent/internal/vad"
+	"xin-chat-robot-agent/internal/vision"
 	"xin-chat-robot-agent/internal/voice"
 
 	adksession "google.golang.org/adk/v2/session"
@@ -127,6 +128,13 @@ func main() {
 	server := api.NewServer(api.Config{
 		Addr:       cfg.Addr,
 		SampleRate: cfg.VAD.SampleRate,
+		Vision: vision.Limits{
+			Enabled:       cfg.Vision.Enabled,
+			MaxFrameBytes: cfg.Vision.MaxFrameBytes,
+			MaxWidth:      cfg.Vision.MaxWidth,
+			MaxHeight:     cfg.Vision.MaxHeight,
+			MaxAge:        cfg.Vision.MaxAge,
+		},
 	}, pipeline, logger,
 		func() (vad.AudioProcessor, error) {
 			return newVADDetector(cfg.VAD)

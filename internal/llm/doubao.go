@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,15 +15,18 @@ import (
 
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
+
+	"xin-chat-robot-agent/internal/vision"
 )
 
 const defaultDoubaoBaseURL = "https://ark.cn-beijing.volces.com/api/v3"
 
 type DoubaoConfig struct {
-	BaseURL string
-	APIKey  string
-	Model   string
-	Timeout time.Duration
+	BaseURL     string
+	APIKey      string
+	Model       string
+	VisionModel string
+	Timeout     time.Duration
 	// Thinking sets the reasoning mode for thinking-capable models
 	// ("disabled" or "enabled"). Empty means leave it to the provider default.
 	Thinking   string
@@ -68,7 +72,7 @@ func (m *DoubaoLLM) Name() string {
 
 func (m *DoubaoLLM) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
-		chatReq, err := m.newChatRequest(req, stream)
+		chatReq, err := m.newChatRequest(ctx, req, stream)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -107,14 +111,14 @@ func (m *DoubaoLLM) GenerateContent(ctx context.Context, req *model.LLMRequest, 
 	}
 }
 
-func (m *DoubaoLLM) newChatRequest(req *model.LLMRequest, stream bool) (doubaoChatRequest, error) {
+func (m *DoubaoLLM) newChatRequest(ctx context.Context, req *model.LLMRequest, stream bool) (doubaoChatRequest, error) {
 	if req == nil {
 		return doubaoChatRequest{}, fmt.Errorf("nil LLM request")
 	}
-	messages := make([]doubaoMessage, 0, len(req.Contents)+1)
+	messages := make([]doubaoRequestMessage, 0, len(req.Contents)+1)
 	if req.Config != nil && req.Config.SystemInstruction != nil {
 		if text := contentText(req.Config.SystemInstruction); text != "" {
-			messages = append(messages, doubaoMessage{Role: "system", Content: text})
+			messages = append(messages, doubaoRequestMessage{Role: "system", Content: text})
 		}
 	}
 	for _, content := range req.Contents {
@@ -122,13 +126,24 @@ func (m *DoubaoLLM) newChatRequest(req *model.LLMRequest, stream bool) (doubaoCh
 		if text == "" {
 			continue
 		}
-		messages = append(messages, doubaoMessage{Role: doubaoRole(content.Role), Content: text})
+		messages = append(messages, doubaoRequestMessage{Role: doubaoRole(content.Role), Content: text})
+	}
+	frame, hasFrame := vision.FrameFromContext(ctx)
+	if hasFrame {
+		if strings.TrimSpace(m.cfg.VisionModel) == "" {
+			return doubaoChatRequest{}, fmt.Errorf("doubao vision model is required when a camera frame is attached")
+		}
+		if err := appendVisionFrame(messages, frame); err != nil {
+			return doubaoChatRequest{}, err
+		}
 	}
 	if len(messages) == 0 {
 		return doubaoChatRequest{}, fmt.Errorf("empty LLM messages")
 	}
 	modelName := strings.TrimSpace(req.Model)
-	if modelName == "" {
+	if hasFrame {
+		modelName = strings.TrimSpace(m.cfg.VisionModel)
+	} else if modelName == "" {
 		modelName = m.cfg.Model
 	}
 	out := doubaoChatRequest{
@@ -205,6 +220,28 @@ func (m *DoubaoLLM) readStream(body io.Reader, yield func(*model.LLMResponse, er
 	yield(&model.LLMResponse{Content: genai.NewContentFromText(full.String(), genai.RoleModel)}, nil)
 }
 
+func appendVisionFrame(messages []doubaoRequestMessage, frame vision.Frame) error {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "user" {
+			continue
+		}
+		text, ok := messages[i].Content.(string)
+		if !ok {
+			return fmt.Errorf("last user message has unsupported content type %T", messages[i].Content)
+		}
+		mimeType := strings.TrimSpace(frame.MIMEType)
+		if mimeType == "" {
+			mimeType = vision.MIMETypeJPEG
+		}
+		messages[i].Content = []doubaoContentPart{
+			{Type: "text", Text: text},
+			{Type: "image_url", ImageURL: &doubaoImageURL{URL: "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(frame.Data)}},
+		}
+		return nil
+	}
+	return fmt.Errorf("camera frame requires a user message")
+}
+
 func contentText(content *genai.Content) string {
 	if content == nil {
 		return ""
@@ -248,11 +285,11 @@ func readErrorBody(body io.Reader) string {
 }
 
 type doubaoChatRequest struct {
-	Model     string          `json:"model"`
-	Messages  []doubaoMessage `json:"messages"`
-	Stream    bool            `json:"stream"`
-	MaxTokens int32           `json:"max_tokens,omitempty"`
-	Thinking  *doubaoThinking `json:"thinking,omitempty"`
+	Model     string                 `json:"model"`
+	Messages  []doubaoRequestMessage `json:"messages"`
+	Stream    bool                   `json:"stream"`
+	MaxTokens int32                  `json:"max_tokens,omitempty"`
+	Thinking  *doubaoThinking        `json:"thinking,omitempty"`
 }
 
 // doubaoThinking controls reasoning models such as doubao-seed-2-0-mini.
@@ -261,6 +298,21 @@ type doubaoChatRequest struct {
 // unacceptable for realtime voice.
 type doubaoThinking struct {
 	Type string `json:"type"`
+}
+
+type doubaoRequestMessage struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"`
+}
+
+type doubaoContentPart struct {
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	ImageURL *doubaoImageURL `json:"image_url,omitempty"`
+}
+
+type doubaoImageURL struct {
+	URL string `json:"url"`
 }
 
 type doubaoMessage struct {

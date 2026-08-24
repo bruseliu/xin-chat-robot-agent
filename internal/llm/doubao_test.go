@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,8 @@ import (
 
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
+
+	"xin-chat-robot-agent/internal/vision"
 )
 
 func TestDoubaoLLMGenerateContentOnce(t *testing.T) {
@@ -78,6 +81,43 @@ func TestDoubaoLLMGenerateContentStream(t *testing.T) {
 	}
 	if contentText(got[2].Content) != "你好" || got[2].Partial {
 		t.Fatalf("final response = %+v", got[2])
+	}
+}
+
+func TestDoubaoLLMBuildsVisionRequest(t *testing.T) {
+	llm, err := NewDoubaoLLM(context.Background(), DoubaoConfig{APIKey: "test-key", Model: "text-endpoint", VisionModel: "vision-endpoint"})
+	if err != nil {
+		t.Fatalf("NewDoubaoLLM() error = %v", err)
+	}
+	frame := vision.Frame{MIMEType: vision.MIMETypeJPEG, Data: []byte{1, 2, 3}}
+	request, err := llm.newChatRequest(vision.WithFrame(t.Context(), frame), &model.LLMRequest{Contents: []*genai.Content{genai.NewContentFromText("画面里有什么？", genai.RoleUser)}}, true)
+	if err != nil {
+		t.Fatalf("newChatRequest() error = %v", err)
+	}
+	if request.Model != "vision-endpoint" {
+		t.Fatalf("model = %q, want vision-endpoint", request.Model)
+	}
+	parts, ok := request.Messages[0].Content.([]doubaoContentPart)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content = %#v, want text and image parts", request.Messages[0].Content)
+	}
+	if parts[0].Type != "text" || parts[0].Text != "画面里有什么？" {
+		t.Fatalf("text part = %+v", parts[0])
+	}
+	wantURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(frame.Data)
+	if parts[1].Type != "image_url" || parts[1].ImageURL == nil || parts[1].ImageURL.URL != wantURL {
+		t.Fatalf("image part = %+v, want %q", parts[1], wantURL)
+	}
+}
+
+func TestDoubaoLLMRejectsFrameWithoutVisionModel(t *testing.T) {
+	llm, err := NewDoubaoLLM(context.Background(), DoubaoConfig{APIKey: "test-key", Model: "text-endpoint"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = llm.newChatRequest(vision.WithFrame(t.Context(), vision.Frame{Data: []byte{1}}), &model.LLMRequest{Contents: []*genai.Content{genai.NewContentFromText("看图", genai.RoleUser)}}, false)
+	if err == nil {
+		t.Fatal("newChatRequest() error = nil, want missing vision model error")
 	}
 }
 

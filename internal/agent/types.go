@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"xin-chat-robot-agent/internal/memory"
+	"xin-chat-robot-agent/internal/vision"
 
 	adkagent "google.golang.org/adk/v2/agent"
 	adkmemory "google.golang.org/adk/v2/memory"
@@ -26,8 +27,11 @@ type TurnInput struct {
 	UserID    string
 	SessionID string
 	Text      string
-	Memories  []memory.Memory
-	Metadata  map[string]string
+	// Frame is attached to the request context only. It is deliberately not
+	// added to the ADK user content, which is persisted by the session service.
+	Frame    *vision.Frame
+	Memories []memory.Memory
+	Metadata map[string]string
 }
 
 type TurnOutput struct {
@@ -135,6 +139,10 @@ func (r *ADKRunner) RunTurnStream(ctx context.Context, input TurnInput, yield fu
 			yield(StreamEvent{Type: StreamEventLLMFinal, Text: output.Text, Final: true})
 		}
 		return output, nil
+	}
+
+	if input.Frame != nil {
+		ctx = vision.WithFrame(ctx, *input.Frame)
 	}
 
 	var delta strings.Builder

@@ -9,13 +9,17 @@ import (
 	"xin-chat-robot-agent/internal/agent"
 	"xin-chat-robot-agent/internal/conversation"
 	"xin-chat-robot-agent/internal/memory"
+	"xin-chat-robot-agent/internal/vision"
 )
 
 type TextTurnInput struct {
-	UserID    string            `json:"user_id"`
-	SessionID string            `json:"session_id,omitempty"`
-	Text      string            `json:"text"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
+	UserID    string `json:"user_id"`
+	SessionID string `json:"session_id,omitempty"`
+	Text      string `json:"text"`
+	// Frame is an ephemeral camera snapshot for this turn. It is excluded from
+	// JSON and all persistence paths.
+	Frame    *vision.Frame     `json:"-"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 type TextTurnOutput struct {
@@ -91,6 +95,7 @@ func (p *Pipeline) HandleTextTurnStream(ctx context.Context, input TextTurnInput
 		UserID:    input.UserID,
 		SessionID: input.SessionID,
 		Text:      input.Text,
+		Frame:     input.Frame,
 		Metadata:  input.Metadata,
 	}, func(event agent.StreamEvent) bool {
 		events = append(events, event)

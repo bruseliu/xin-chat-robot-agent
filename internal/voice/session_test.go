@@ -4,9 +4,11 @@ import (
 	"context"
 	"log/slog"
 	"testing"
+	"time"
 
 	"xin-chat-robot-agent/internal/agent"
 	"xin-chat-robot-agent/internal/vad"
+	"xin-chat-robot-agent/internal/vision"
 )
 
 func TestVoiceSessionWritesASRUntilFinalAudio(t *testing.T) {
@@ -158,6 +160,25 @@ func TestVoiceSessionCloseReleasesResourcesOnce(t *testing.T) {
 	}
 	if asr.closes != 1 {
 		t.Fatalf("ASR closes = %d, want 1", asr.closes)
+	}
+}
+
+func TestVoiceSessionPassesLatestCameraFrameAtTurnStart(t *testing.T) {
+	runner := &fakeRunner{}
+	pipeline := NewPipeline(runner, nil, slog.Default())
+	processor := &fakeVoiceVAD{out: vad.AudioOutput{Chunk: vad.Chunk{Samples: []float32{0.1}, SampleRate: 16000}, VADEnd: true}}
+	asr := &fakeStreamingASR{transcript: Transcript{Text: "这是什么"}}
+	session, err := NewVoiceSession(pipeline, processor, asr, VoiceSessionConfig{UserID: "alice", SessionID: "s1", Vision: vision.Limits{Enabled: true, MaxAge: time.Second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := vision.Frame{MIMEType: vision.MIMETypeJPEG, Data: []byte{1, 2, 3}, CapturedAt: time.Now()}
+	session.SetLatestFrame(frame)
+	if _, err := session.ProcessAudio(t.Context(), AudioChunk{Samples: []float32{0.1}, SampleRate: 16000}); err != nil {
+		t.Fatal(err)
+	}
+	if runner.last.Frame == nil || string(runner.last.Frame.Data) != string(frame.Data) {
+		t.Fatalf("runner frame = %+v, want latest camera frame", runner.last.Frame)
 	}
 }
 

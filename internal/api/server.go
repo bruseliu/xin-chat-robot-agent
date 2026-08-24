@@ -12,12 +12,14 @@ import (
 	"github.com/gorilla/websocket"
 
 	"xin-chat-robot-agent/internal/vad"
+	"xin-chat-robot-agent/internal/vision"
 	"xin-chat-robot-agent/internal/voice"
 )
 
 type Config struct {
 	Addr       string
 	SampleRate int
+	Vision     vision.Limits
 }
 
 type VADFactory func() (vad.AudioProcessor, error)
@@ -60,6 +62,7 @@ type Server struct {
 	sampleRate     int
 	onSessionClose SessionCloseFunc
 	bargeIn        voice.BargeInConfig
+	vision         vision.Limits
 }
 
 type ServerOption func(*Server)
@@ -80,6 +83,7 @@ func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger, vadFac
 	if cfg.SampleRate == 0 {
 		cfg.SampleRate = vad.DefaultSampleRate
 	}
+	cfg.Vision = cfg.Vision.Normalize()
 	server := &Server{
 		pipeline:   pipeline,
 		logger:     logger,
@@ -87,6 +91,7 @@ func NewServer(cfg Config, pipeline *voice.Pipeline, logger *slog.Logger, vadFac
 		vadFactory: vadFactory,
 		asrFactory: asrFactory,
 		sampleRate: cfg.SampleRate,
+		vision:     cfg.Vision,
 	}
 	for _, opt := range opts {
 		opt(server)
@@ -290,6 +295,7 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 		},
 		TTSFactory: s.ttsFactory,
 		BargeIn:    s.bargeIn,
+		Vision:     s.vision,
 	})
 	if err != nil {
 		if processor != nil {
@@ -379,28 +385,43 @@ func (s *Server) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
 				writeWSError(conn, "invalid_control_message", err)
 				return
 			}
-			if msg.Type != "final" {
+			switch msg.Type {
+			case "video_frame":
+				if !s.vision.Enabled {
+					s.logger.Debug("camera frame ignored while vision is disabled")
+					continue
+				}
+				frame, err := vision.DecodeBase64JPEG(msg.Data, msg.MIMEType, s.vision)
+				if err != nil {
+					s.logger.Warn("invalid camera frame", "error", err, "user_id", userID, "session_id", sessionID)
+					continue
+				}
+				session.SetLatestFrame(frame)
+			case "final":
+				out, err := session.ProcessAudio(r.Context(), voice.AudioChunk{SampleRate: sampleRate, Final: true})
+				if err != nil {
+					closeSession()
+					writeWSError(conn, "voice_finalize_failed", err)
+					return
+				}
+				if outputs == nil && out.Final {
+					if err := conn.WriteJSON(out); err != nil {
+						return
+					}
+				}
+			default:
 				closeSession()
 				writeWSError(conn, "unsupported_control_message", fmt.Errorf("unsupported control type %q", msg.Type))
 				return
-			}
-			out, err := session.ProcessAudio(r.Context(), voice.AudioChunk{SampleRate: sampleRate, Final: true})
-			if err != nil {
-				closeSession()
-				writeWSError(conn, "voice_finalize_failed", err)
-				return
-			}
-			if outputs == nil && out.Final {
-				if err := conn.WriteJSON(out); err != nil {
-					return
-				}
 			}
 		}
 	}
 }
 
 type voiceControlMessage struct {
-	Type string `json:"type"`
+	Type     string `json:"type"`
+	MIMEType string `json:"mime_type,omitempty"`
+	Data     string `json:"data,omitempty"`
 }
 
 func writeWSError(conn *websocket.Conn, code string, err error) {

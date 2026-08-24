@@ -1991,3 +1991,112 @@ Silero VADEnd -> SEGMENT_END -> decode current segment -> return one final
 This keeps the FunASR service memory and response size bounded for a long-lived
 microphone session. Speaker diarization remains disabled; enabling cross-segment
 speaker identity in the future requires preserving that state separately.
+
+
+## Development Log: Realtime Camera Understanding (2026-08-24, implementation complete; real service pending)
+
+### Scope
+
+First visual capability is deliberately a low-rate camera snapshot attached to
+one spoken turn:
+
+```text
+camera -> latest JPEG only -> WebSocket video_frame control message
+-> VoiceSession snapshot at ASR sentence end -> Doubao vision request
+```
+
+This is not video streaming. The client will send at most one compressed JPEG
+per configured interval; the server retains only the most recent valid frame
+for that WebSocket connection. When FunASR yields a final sentence, the frame
+is snapshotted for that turn. A newer frame cannot change an in-flight request.
+
+### Chosen wire format
+
+The existing binary WebSocket frames remain PCM input and PCM TTS output. A
+camera frame uses a text control message so the two media types cannot be
+confused:
+
+```json
+{"type":"video_frame","mime_type":"image/jpeg","data":"<Base64 JPEG>"}
+```
+
+The server decodes and verifies Base64/JPEG before accepting it; client-supplied
+width and height are intentionally not trusted. The planned initial limits are
+512 KiB JPEG payload, 1280x720 maximum resolution, and a three-second maximum
+frame age. Invalid or expired frames are ignored, so a normal voice turn still
+works without camera input.
+
+### Backend completed in this working tree
+
+- Added `internal/vision.Frame` and `vision.Limits`. It validates Base64 JPEG,
+  checks byte/dimension limits, copies image bytes defensively, and provides a
+  request-context carrier. Frames are process-memory-only data.
+- `internal/api/server.go` now recognizes `video_frame` when `VISION_ENABLED`
+  is true. It validates the frame and calls `VoiceSession.SetLatestFrame`.
+- `VoiceSession` retains only one guarded latest frame, snapshots it when a
+  server-endpointing ASR sentence starts, and also supplies it to the legacy
+  local-VAD finalization path. `Close()` clears the frame.
+- `TextTurnInput` and `agent.TurnInput` carry the optional frame through the
+  pipeline. `ADKRunner` places it in `context.Context` while still passing a
+  text-only `genai.Content` to ADK. Consequently no image bytes are placed in
+  ADK session events, PostgreSQL conversation records, or mem0 writes.
+- `internal/llm/doubao.go` selects `DOUBAO_VISION_MODEL` only for a request
+  carrying a frame. The last user message becomes text plus:
+
+  ```json
+  {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,<...>"}}
+  ```
+
+  Text-only turns continue to use `DOUBAO_LLM_MODEL`. A frame with no configured
+  vision model returns a clear provider error rather than silently using a
+  text-only endpoint.
+- Added configuration types and server wiring for `VISION_ENABLED`,
+  `VISION_MAX_FRAME_BYTES`, `VISION_MAX_WIDTH`, `VISION_MAX_HEIGHT`,
+  `VISION_MAX_FRAME_AGE_SECONDS`, and `DOUBAO_VISION_MODEL`. Example environment
+  documentation still needs updating before this feature is declared complete.
+- Added unit coverage for Base64 JPEG validation/copying, Base64 data-URL
+  construction and vision endpoint selection, missing vision-model rejection,
+  and VoiceSession sentence-time frame forwarding.
+
+Verification already passed after these backend changes:
+
+```bash
+gofmt -w internal/vision/frame.go internal/vision/frame_test.go \
+  internal/agent/types.go internal/voice/pipeline.go internal/voice/session.go \
+  internal/llm/doubao.go internal/config/config.go internal/api/server.go \
+  cmd/server/main.go internal/llm/doubao_test.go internal/voice/session_test.go
+
+go test ./internal/vision ./internal/llm ./internal/agent ./internal/voice \
+  ./internal/api ./internal/config ./cmd/server
+```
+
+### Client completed
+
+- `client/voice_client.py` now uses an OpenCV capture thread that keeps only the
+  newest JPEG in memory. Capture defaults to 5 Hz (`VIDEO_CAPTURE_INTERVAL_SECONDS=0.2`),
+  while upload defaults to one current frame per second
+  (`VIDEO_SEND_INTERVAL_SECONDS=1`).
+- The camera uploader sends the exact `video_frame` Base64 JSON protocol and
+  shares one `asyncio.Lock` with PCM transmission, preventing interleaved
+  WebSocket writes. Shutdown cancels all tasks and releases the camera.
+- `client/requirements.txt` now includes `opencv-python`; `.env.example` and
+  `README.md` document the server variables and launch command.
+- `python3 -m py_compile client/voice_client.py` passes. No physical camera was
+  opened by that syntax-only check, and no image file is written by the client.
+
+### Additional protocol verification
+
+`TestVoiceWebSocketPassesCameraFrameToTurn` opens a test WebSocket, sends a
+valid Base64 JPEG `video_frame`, then sends PCM. It verifies that the completed
+turn receives the expected 2x1 frame. This covers decoding, per-connection
+storage, and sentence-time pipeline forwarding.
+
+### Remaining work before real-service testing
+
+1. Configure a provisioned visual Ark endpoint in local `.env` as
+   `DOUBAO_VISION_MODEL`; do not assume the current text endpoint accepts
+   images.
+2. Run a real camera + spoken question + Doubao visual endpoint test, recording
+   only timing and byte-size metadata, never the frame contents.
+3. Decide whether the first production camera profile needs lower resolution or
+   a shorter frame-age limit after measuring Ark visual-token cost and latency.

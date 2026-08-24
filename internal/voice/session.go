@@ -13,6 +13,7 @@ import (
 	"xin-chat-robot-agent/internal/agent"
 	"xin-chat-robot-agent/internal/tts"
 	"xin-chat-robot-agent/internal/vad"
+	"xin-chat-robot-agent/internal/vision"
 )
 
 type AudioChunk struct {
@@ -63,6 +64,7 @@ type VoiceSessionConfig struct {
 	Metadata   map[string]string
 	TTSFactory TTSFactory
 	BargeIn    BargeInConfig
+	Vision     vision.Limits
 }
 
 type VoiceTurnOutput struct {
@@ -92,6 +94,9 @@ type VoiceSession struct {
 	activeTTS   tts.Stream
 	logger      *slog.Logger
 	turnActive  atomic.Bool
+
+	frameMu     sync.RWMutex
+	latestFrame *vision.Frame
 
 	// turnMu guards turnCancel/turnDone, which describe the turn currently in
 	// flight. Both are nil while idle.
@@ -158,6 +163,7 @@ func newVoiceSession(ctx context.Context, pipeline *Pipeline, processor vad.Audi
 	}
 	logger := pipeline.logger.With("user_id", cfg.UserID, "session_id", cfg.SessionID)
 	cfg.BargeIn = cfg.BargeIn.normalize()
+	cfg.Vision = cfg.Vision.Normalize()
 	session := &VoiceSession{
 		pipeline:   pipeline,
 		vad:        processor,
@@ -180,6 +186,36 @@ func newVoiceSession(ctx context.Context, pipeline *Pipeline, processor vad.Audi
 		logger.Info("voice session started", "mode", "local_vad")
 	}
 	return session, nil
+}
+
+// SetLatestFrame replaces the connection-local camera snapshot. Frame data is
+// copied because the websocket read buffer is owned by the transport.
+func (s *VoiceSession) SetLatestFrame(frame vision.Frame) {
+	if s == nil || !s.cfg.Vision.Enabled {
+		return
+	}
+	copy := frame.Clone()
+	s.frameMu.Lock()
+	s.latestFrame = &copy
+	s.frameMu.Unlock()
+	s.logger.Debug("camera frame accepted", "bytes", len(copy.Data), "width", copy.Width, "height", copy.Height)
+}
+
+func (s *VoiceSession) latestFrameSnapshot() *vision.Frame {
+	if s == nil || !s.cfg.Vision.Enabled {
+		return nil
+	}
+	s.frameMu.RLock()
+	frame := s.latestFrame
+	if frame != nil {
+		copy := frame.Clone()
+		frame = &copy
+	}
+	s.frameMu.RUnlock()
+	if frame == nil || frame.Expired(time.Now(), s.cfg.Vision.MaxAge) {
+		return nil
+	}
+	return frame
 }
 
 // emit forwards a frame produced by turn seq, dropping it if that turn has since
@@ -287,6 +323,7 @@ func (s *VoiceSession) startTurn(transcript Transcript) uint64 {
 	// observes an idle session while a turn is being set up.
 	s.turnActive.Store(true)
 	s.emit(seq, VoiceTurnOutput{Type: "sentence", Transcript: transcript})
+	frame := s.latestFrameSnapshot()
 
 	go func() {
 		// Defers run LIFO: turnActive clears before done closes, so a caller that
@@ -295,7 +332,7 @@ func (s *VoiceSession) startTurn(transcript Transcript) uint64 {
 		defer cancel()
 		defer s.turnActive.Store(false)
 
-		output, err := s.runTextTurn(ctx, seq, transcript)
+		output, err := s.runTextTurn(ctx, seq, transcript, frame)
 		switch {
 		case ctx.Err() != nil:
 			// Checked first: tearing down the TTS connection makes the turn's own
@@ -361,7 +398,7 @@ func (s *VoiceSession) interruptTurn(reason string, notify bool) {
 	}
 }
 
-func (s *VoiceSession) runTextTurn(ctx context.Context, seq uint64, transcript Transcript) (VoiceTurnOutput, error) {
+func (s *VoiceSession) runTextTurn(ctx context.Context, seq uint64, transcript Transcript, frame *vision.Frame) (VoiceTurnOutput, error) {
 	transcript.IsFinal = true
 	metadata := cloneMetadata(s.cfg.Metadata)
 	metadata["source"] = "voice_session"
@@ -402,7 +439,7 @@ func (s *VoiceSession) runTextTurn(ctx context.Context, seq uint64, transcript T
 
 	response, err := s.pipeline.HandleTextTurnStream(ctx, TextTurnInput{
 		UserID: s.cfg.UserID, SessionID: s.cfg.SessionID,
-		Text: strings.TrimSpace(transcript.Text), Metadata: metadata,
+		Text: strings.TrimSpace(transcript.Text), Frame: frame, Metadata: metadata,
 	}, func(event agent.StreamEvent) bool {
 		// The ADK runner does not check ctx between events, so stop the iteration
 		// here as soon as the turn is cancelled.
@@ -643,6 +680,7 @@ func (s *VoiceSession) finalizeASRTurn(ctx context.Context, streamFinal bool) (V
 		UserID:    s.cfg.UserID,
 		SessionID: s.cfg.SessionID,
 		Text:      text,
+		Frame:     s.latestFrameSnapshot(),
 		Metadata:  metadata,
 	})
 	if err != nil {
@@ -699,6 +737,9 @@ func (s *VoiceSession) closeResources() error {
 		close(s.closed)
 	}
 	s.interruptTurn("session_close", false)
+	s.frameMu.Lock()
+	s.latestFrame = nil
+	s.frameMu.Unlock()
 
 	var first error
 	s.ttsMu.Lock()

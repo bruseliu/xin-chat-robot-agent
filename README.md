@@ -209,6 +209,33 @@ curl -X POST http://localhost:8080/v1/chat/text \
   -d '{"user_id":"alice","session_id":"demo","text":"我喜欢安静一点的说话方式"}'
 ```
 
+## Camera Vision
+
+The optional first visual mode sends a low-rate JPEG snapshot with the next
+spoken turn; it does not store or stream video. Enable the server only after
+configuring an Ark image-capable endpoint:
+
+```env
+VISION_ENABLED=true
+DOUBAO_VISION_MODEL=<Ark vision endpoint>
+```
+
+Install the client dependency in its virtual environment, then start the
+microphone and camera client. The camera captures at 5 Hz by default, uploads
+at most one latest JPEG per second, and keeps no image files on disk:
+
+```bash
+cd client
+.venv/bin/pip install -r requirements.txt
+VIDEO_ENABLED=1 .venv/bin/python voice_client.py
+```
+
+When the client and server are on different hosts, also set
+`VOICE_SERVER_URL=ws://<server-ip>:8080/v1/chat/voice`. The service accepts only
+`image/jpeg` Base64 frames (`video_frame` control messages); it applies the
+configured size, resolution, and age limits before the image is sent to the
+vision model.
+
 ## Next Work
 
 1. Validate `/v1/chat/voice` end to end with the configured Postgres and LLM services, using a real microphone WebSocket client.
