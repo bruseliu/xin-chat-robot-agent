@@ -136,6 +136,9 @@ func (c *Mem0Client) Add(ctx context.Context, req AddRequest) error {
 	if req.Infer != nil {
 		payload["infer"] = *req.Infer
 	}
+	if req.Prompt != "" {
+		payload["prompt"] = req.Prompt
+	}
 
 	ctx, cancel := c.withTimeout(ctx, c.writeTimeout)
 	defer cancel()

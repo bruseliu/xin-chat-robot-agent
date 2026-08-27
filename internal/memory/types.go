@@ -2,6 +2,11 @@ package memory
 
 import "context"
 
+// EnglishFactExtractionPrompt keeps stored facts in one language even when
+// conversations contain Chinese or other languages. This makes retrieval and
+// subsequent prompts consistent across users and environments.
+const EnglishFactExtractionPrompt = "Extract only durable user facts, preferences, and relevant context. Write every extracted memory in concise natural English, regardless of the input language. Preserve the original meaning; do not include commentary or markdown."
+
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
@@ -34,6 +39,7 @@ type AddRequest struct {
 	Messages []Message
 	Metadata map[string]any
 	Infer    *bool
+	Prompt   string
 
 	done chan struct{} // internal: signals flush completion
 }

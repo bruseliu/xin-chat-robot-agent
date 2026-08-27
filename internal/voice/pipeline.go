@@ -126,6 +126,7 @@ func (p *Pipeline) HandleTextTurnStream(ctx context.Context, input TextTurnInput
 				"session_id": input.SessionID,
 				"source":     "text_turn",
 			},
+			Prompt: memory.EnglishFactExtractionPrompt,
 		})
 	}
 

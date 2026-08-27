@@ -52,6 +52,7 @@ func (s *ADKService) AddSessionToMemory(ctx context.Context, curSession session.
 			"session_id": curSession.ID(),
 			"source":     "adk_session",
 		},
+		Prompt: EnglishFactExtractionPrompt,
 	})
 }
 
