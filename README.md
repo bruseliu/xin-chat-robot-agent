@@ -243,9 +243,28 @@ When the client and server are on different hosts, also set
 configured size, resolution, and age limits before the image is sent to the
 vision model.
 
+## Voice E2E Smoke
+
+The opt-in smoke command streams a prerecorded 16 kHz WAV through one real
+`/v1/chat/voice` WebSocket session. It reports ASR finals, first LLM delta,
+first TTS PCM, TTS completion, interruption count, and PCM byte count; it never
+writes audio to disk. It uses a generated test user/session identity, so it does
+not read normal user conversations, but it can create isolated session and
+mem0 records.
+
+```bash
+VOICE_E2E_REAL_TEST=1 go run ./scripts/voice-e2e \
+  internal/vad/testdata/test2.wav
+```
+
+Set `VOICE_E2E_URL` when the voice service is not local. The explicit flag is
+required because the command calls the configured ASR, LLM, and TTS services.
+
 ## Next Work
 
-1. Validate `/v1/chat/voice` end to end with the configured Postgres and LLM services, using a real microphone WebSocket client.
+1. Run the real voice E2E smoke command and retain a timing baseline for the
+   configured deployment.
 2. Add a local ASR health check and restart policy.
-3. Implement the streaming TTS adapter outside the ADK graph.
-4. Add barge-in / interruption control.
+3. Add CI that runs `go test ./...` on each change.
+4. Add a real camera-plus-voice E2E smoke scenario after measuring visual-token
+   latency and cost.

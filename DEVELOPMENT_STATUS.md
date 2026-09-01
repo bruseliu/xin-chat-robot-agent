@@ -2098,3 +2098,19 @@ storage, and sentence-time pipeline forwarding.
    only timing and byte-size metadata, never the frame contents.
 3. Decide whether the first production camera profile needs lower resolution or
    a shorter frame-age limit after measuring Ark visual-token cost and latency.
+
+
+## Development Log: Single-Session Voice E2E Smoke (2026-09-01)
+
+- Added `scripts/voice-e2e`, an opt-in real-service command that streams one
+  prerecorded 16 kHz WAV through `/v1/chat/voice` in 200 ms PCM chunks. The
+  multi-sentence input naturally exercises sequential turns and reports ASR
+  finals, first LLM delta, TTS lifecycle, received PCM bytes, and interrupts.
+- It requires `VOICE_E2E_REAL_TEST=1`, uses generated isolated user/session IDs
+  by default, has a 90-second terminal timeout, and does not write audio files.
+  `VOICE_E2E_URL`, `VOICE_E2E_USER_ID`, and `VOICE_E2E_SESSION_ID` may override
+  the endpoint and identities.
+- Verified without provider calls: the safety gate rejects an unset flag, and
+  `go test ./...` compiles the command alongside all repository packages. A real
+  provider run remains intentionally manual because it incurs ASR, LLM, and TTS
+  usage and can create isolated memory/session records.
