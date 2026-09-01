@@ -422,16 +422,16 @@ if s.endpointing != nil {
 #### 测试验证
 
 **测试脚本**:
-- `scripts/test_segment_end.go` — 协议级验证：对半切音频 + SEGMENT_END + 继续发送 + STOP
-- `scripts/test_vad_funasr_e2e.go` — 完整链路：Silero VAD 驱动 + FunASR + SEGMENT_END + 延迟测量 + 去重
+- `scripts/funasr-segment-end` — 协议级验证：对半切音频 + SEGMENT_END + 继续发送 + STOP
+- `scripts/vad-funasr-e2e` — 完整链路：Silero VAD 驱动 + FunASR + SEGMENT_END + 延迟测量 + 去重
 
 **运行命令**:
 ```bash
 # 协议验证
-go run scripts/test_segment_end.go internal/vad/testdata/test2.wav
+go run ./scripts/funasr-segment-end internal/vad/testdata/test2.wav
 
 # 完整 E2E (Silero VAD + FunASR)
-go run scripts/test_vad_funasr_e2e.go internal/vad/testdata/test2.wav
+go run ./scripts/vad-funasr-e2e internal/vad/testdata/test2.wav
 ```
 
 **E2E 测试结果** (`test2.wav`, 8.6s, 中文 3 句):
@@ -863,13 +863,13 @@ go test ./internal/tts ./internal/llm ./internal/voice ./internal/api ./cmd/serv
 
 These packages pass. `git diff --check` also passes.
 
-The repository-wide command currently has a pre-existing structural failure unrelated to TTS:
+The repository-wide command is now a supported regression check:
 
 ```bash
 go test ./...
 ```
 
-The `scripts` directory contains multiple standalone `package main` programs in one directory (`test_funasr_realtime.go`, `test_segment_end.go`, and `test_vad_funasr_e2e.go`), so Go reports duplicate `main` declarations when treating that directory as one package. Each script remains runnable individually with `go run <file>`.
+Each standalone script now lives in its own Go command directory, so `go test ./...` compiles them independently. Run a tool with `go run ./scripts/<tool> [wav-path]`.
 
 ### FunASR Environment and Segment-End Status
 
@@ -1671,7 +1671,7 @@ func (s sessionView) Events() adksession.Events {
 2. **mem0 写入耗时随库大小线性增长** — 长期使用需要关注。mem0 每次 add 都要检索相似记忆并让 LLM 逐条判定 ADD/UPDATE/DELETE，记忆上千条后可能需要分片或归档策略。
 3. **`llmagent.Config.Description` 仍是英文** — 会进 system instruction，建议改中文。
 4. **记忆注入无相关性阈值** — 当前固定注入 top 8，不管分数高低。噪声记忆仍可能挤掉有用记忆。
-5. **`scripts/` 目录多个 `package main`** — `go test ./...` 报重复 main 声明（既有问题，非本轮引入）。
+5. **`scripts/` 命令结构** — 已于 2026-09-01 拆分为独立 Go 命令目录，`go test ./...` 不再因重复 `main` 失败。
 
 ---
 
@@ -1850,7 +1850,7 @@ PGPASSWORD=mem0pass psql -h 127.0.0.1 -U mem0 -d mem0 -tAc \
 6. **mem0 写入耗时随库大小增长** — 1 条时 4.5s，20 条时 >30s。当前靠放宽超时绕过，不是解决。
 7. **记忆注入无相关性阈值** — 固定 top 8 不看分数。分数普遍挤在 0.84–0.88，排序区分度低，噪声仍可能挤掉有用记忆。
 8. **`llmagent.Config.Description` 仍是英文** — 会进 system instruction。
-9. **`scripts/` 目录多个 `package main`** — `go test ./...` 报重复 main（既有问题）。
+9. **`scripts/` 命令结构** — 已于 2026-09-01 拆分为独立 Go 命令目录，`go test ./...` 不再因重复 `main` 失败。
 
 ---
 
@@ -1901,7 +1901,7 @@ ASR 连接被对端关闭时，API 路径可能显式调用 `VoiceSession.Close(
 - 端到端命令：
 
   ```bash
-  go run scripts/test_vad_funasr_e2e.go internal/vad/testdata/test2.wav
+  go run ./scripts/vad-funasr-e2e internal/vad/testdata/test2.wav
   ```
 
   同一条 FunASR WebSocket 收到 3 个 Silero 边界并返回 3 句 final：
