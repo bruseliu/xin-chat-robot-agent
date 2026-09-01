@@ -324,6 +324,13 @@ func (s *VoiceSession) startTurn(transcript Transcript) uint64 {
 	s.turnActive.Store(true)
 	s.emit(seq, VoiceTurnOutput{Type: "sentence", Transcript: transcript})
 	frame := s.latestFrameSnapshot()
+	if s.cfg.Vision.Enabled {
+		if frame == nil {
+			s.logger.Warn("vision frame unavailable for turn")
+		} else {
+			s.logger.Info("vision frame attached to turn", "bytes", len(frame.Data), "width", frame.Width, "height", frame.Height)
+		}
+	}
 
 	go func() {
 		// Defers run LIFO: turnActive clears before done closes, so a caller that

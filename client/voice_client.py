@@ -74,6 +74,8 @@ class CameraCapture:
         self._lock = threading.Lock()
         self._latest = None
         self._version = 0
+        self._reported_capture = False
+        self._reported_read_failure = False
         self._running = threading.Event()
         self._thread = None
 
@@ -87,6 +89,9 @@ class CameraCapture:
             while self._running.is_set():
                 ok, frame = self._capture.read()
                 if not ok:
+                    if not self._reported_read_failure:
+                        print(f"[camera] Cannot read a frame from device {VIDEO_DEVICE_INDEX}")
+                        self._reported_read_failure = True
                     time.sleep(0.1)
                     continue
                 height, width = frame.shape[:2]
@@ -99,6 +104,9 @@ class CameraCapture:
                 with self._lock:
                     self._latest = encoded.tobytes()
                     self._version += 1
+                if not self._reported_capture:
+                    print(f"[camera] Capturing {frame.shape[1]}x{frame.shape[0]} JPEG frames")
+                    self._reported_capture = True
                 time.sleep(max(VIDEO_CAPTURE_INTERVAL_SECONDS, 0.02))
         finally:
             self._capture.release()
@@ -255,6 +263,7 @@ async def send_mic_audio(ws: websockets.WebSocketClientProtocol, stop_event: asy
 async def send_camera_frames(ws: websockets.WebSocketClientProtocol, camera: CameraCapture, stop_event: asyncio.Event, send_lock: asyncio.Lock):
     """Upload one current JPEG per interval; the server retains only the latest."""
     last_version = 0
+    sent_frames = 0
     try:
         while not stop_event.is_set():
             frame, version = camera.latest()
@@ -263,9 +272,14 @@ async def send_camera_frames(ws: websockets.WebSocketClientProtocol, camera: Cam
                 async with send_lock:
                     await ws.send(json.dumps(payload, separators=(",", ":")))
                 last_version = version
+                sent_frames += 1
+                if sent_frames == 1:
+                    print(f"[camera] Uploading JPEG frames every {VIDEO_SEND_INTERVAL_SECONDS:.1f}s")
             await asyncio.sleep(max(VIDEO_SEND_INTERVAL_SECONDS, 0.1))
     except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
         pass
+    except Exception as exc:
+        print(f"[camera] Upload failed: {exc}")
 
 
 async def recv_messages(ws: websockets.WebSocketClientProtocol, player: TTSPlayer, stop_event: asyncio.Event):

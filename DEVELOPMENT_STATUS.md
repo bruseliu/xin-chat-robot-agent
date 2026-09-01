@@ -2040,22 +2040,21 @@ works without camera input.
   pipeline. `ADKRunner` places it in `context.Context` while still passing a
   text-only `genai.Content` to ADK. Consequently no image bytes are placed in
   ADK session events, PostgreSQL conversation records, or mem0 writes.
-- `internal/llm/doubao.go` selects `DOUBAO_VISION_MODEL` only for a request
-  carrying a frame. The last user message becomes text plus:
+- `internal/llm/doubao.go` keeps using `DOUBAO_LLM_MODEL` for every turn. A
+  camera frame changes only the last user message, which becomes text plus:
 
   ```json
   {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,<...>"}}
   ```
 
-  Text-only turns continue to use `DOUBAO_LLM_MODEL`. A frame with no configured
-  vision model returns a clear provider error rather than silently using a
-  text-only endpoint.
+  Therefore `DOUBAO_LLM_MODEL` must reference a multimodal Ark endpoint whenever
+  `VISION_ENABLED=true`; no second model name is configured or selected.
 - Added configuration types and server wiring for `VISION_ENABLED`,
   `VISION_MAX_FRAME_BYTES`, `VISION_MAX_WIDTH`, `VISION_MAX_HEIGHT`,
-  `VISION_MAX_FRAME_AGE_SECONDS`, and `DOUBAO_VISION_MODEL`. Example environment
-  documentation still needs updating before this feature is declared complete.
+  and `VISION_MAX_FRAME_AGE_SECONDS`. The visual request reuses the configured
+  `DOUBAO_LLM_MODEL`.
 - Added unit coverage for Base64 JPEG validation/copying, Base64 data-URL
-  construction and vision endpoint selection, missing vision-model rejection,
+  construction and same-model selection,
   and VoiceSession sentence-time frame forwarding.
 
 Verification already passed after these backend changes:
@@ -2093,9 +2092,8 @@ storage, and sentence-time pipeline forwarding.
 
 ### Remaining work before real-service testing
 
-1. Configure a provisioned visual Ark endpoint in local `.env` as
-   `DOUBAO_VISION_MODEL`; do not assume the current text endpoint accepts
-   images.
+1. Set `VISION_ENABLED=true` in local `.env` after confirming the existing
+   `DOUBAO_LLM_MODEL` endpoint accepts image input.
 2. Run a real camera + spoken question + Doubao visual endpoint test, recording
    only timing and byte-size metadata, never the frame contents.
 3. Decide whether the first production camera profile needs lower resolution or

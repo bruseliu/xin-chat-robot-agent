@@ -212,12 +212,11 @@ curl -X POST http://localhost:8080/v1/chat/text \
 ## Camera Vision
 
 The optional first visual mode sends a low-rate JPEG snapshot with the next
-spoken turn; it does not store or stream video. Enable the server only after
-configuring an Ark image-capable endpoint:
+spoken turn; it does not store or stream video. Enable the server only when the configured `DOUBAO_LLM_MODEL` is image-capable:
 
 ```env
 VISION_ENABLED=true
-DOUBAO_VISION_MODEL=<Ark vision endpoint>
+# DOUBAO_LLM_MODEL must be an Ark endpoint that accepts both text and image input.
 ```
 
 Install the client dependency in its virtual environment, then start the
@@ -228,6 +227,14 @@ at most one latest JPEG per second, and keeps no image files on disk:
 cd client
 .venv/bin/pip install -r requirements.txt
 VIDEO_ENABLED=1 .venv/bin/python voice_client.py
+```
+
+For speaker playback without echo cancellation, run in half-duplex mode to avoid
+recognizing the assistant's own voice. This disables barge-in while the queued
+TTS audio is still playing:
+
+```bash
+VIDEO_ENABLED=1 MIC_MUTE_DURING_TTS=1 .venv/bin/python voice_client.py
 ```
 
 When the client and server are on different hosts, also set

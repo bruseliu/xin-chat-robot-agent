@@ -85,7 +85,7 @@ func TestDoubaoLLMGenerateContentStream(t *testing.T) {
 }
 
 func TestDoubaoLLMBuildsVisionRequest(t *testing.T) {
-	llm, err := NewDoubaoLLM(context.Background(), DoubaoConfig{APIKey: "test-key", Model: "text-endpoint", VisionModel: "vision-endpoint"})
+	llm, err := NewDoubaoLLM(context.Background(), DoubaoConfig{APIKey: "test-key", Model: "multimodal-endpoint"})
 	if err != nil {
 		t.Fatalf("NewDoubaoLLM() error = %v", err)
 	}
@@ -94,8 +94,8 @@ func TestDoubaoLLMBuildsVisionRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newChatRequest() error = %v", err)
 	}
-	if request.Model != "vision-endpoint" {
-		t.Fatalf("model = %q, want vision-endpoint", request.Model)
+	if request.Model != "multimodal-endpoint" {
+		t.Fatalf("model = %q, want multimodal-endpoint", request.Model)
 	}
 	parts, ok := request.Messages[0].Content.([]doubaoContentPart)
 	if !ok || len(parts) != 2 {
@@ -107,17 +107,6 @@ func TestDoubaoLLMBuildsVisionRequest(t *testing.T) {
 	wantURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(frame.Data)
 	if parts[1].Type != "image_url" || parts[1].ImageURL == nil || parts[1].ImageURL.URL != wantURL {
 		t.Fatalf("image part = %+v, want %q", parts[1], wantURL)
-	}
-}
-
-func TestDoubaoLLMRejectsFrameWithoutVisionModel(t *testing.T) {
-	llm, err := NewDoubaoLLM(context.Background(), DoubaoConfig{APIKey: "test-key", Model: "text-endpoint"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = llm.newChatRequest(vision.WithFrame(t.Context(), vision.Frame{Data: []byte{1}}), &model.LLMRequest{Contents: []*genai.Content{genai.NewContentFromText("看图", genai.RoleUser)}}, false)
-	if err == nil {
-		t.Fatal("newChatRequest() error = nil, want missing vision model error")
 	}
 }
 

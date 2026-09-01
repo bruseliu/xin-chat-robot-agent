@@ -22,11 +22,10 @@ import (
 const defaultDoubaoBaseURL = "https://ark.cn-beijing.volces.com/api/v3"
 
 type DoubaoConfig struct {
-	BaseURL     string
-	APIKey      string
-	Model       string
-	VisionModel string
-	Timeout     time.Duration
+	BaseURL string
+	APIKey  string
+	Model   string
+	Timeout time.Duration
 	// Thinking sets the reasoning mode for thinking-capable models
 	// ("disabled" or "enabled"). Empty means leave it to the provider default.
 	Thinking   string
@@ -128,11 +127,7 @@ func (m *DoubaoLLM) newChatRequest(ctx context.Context, req *model.LLMRequest, s
 		}
 		messages = append(messages, doubaoRequestMessage{Role: doubaoRole(content.Role), Content: text})
 	}
-	frame, hasFrame := vision.FrameFromContext(ctx)
-	if hasFrame {
-		if strings.TrimSpace(m.cfg.VisionModel) == "" {
-			return doubaoChatRequest{}, fmt.Errorf("doubao vision model is required when a camera frame is attached")
-		}
+	if frame, ok := vision.FrameFromContext(ctx); ok {
 		if err := appendVisionFrame(messages, frame); err != nil {
 			return doubaoChatRequest{}, err
 		}
@@ -141,9 +136,7 @@ func (m *DoubaoLLM) newChatRequest(ctx context.Context, req *model.LLMRequest, s
 		return doubaoChatRequest{}, fmt.Errorf("empty LLM messages")
 	}
 	modelName := strings.TrimSpace(req.Model)
-	if hasFrame {
-		modelName = strings.TrimSpace(m.cfg.VisionModel)
-	} else if modelName == "" {
+	if modelName == "" {
 		modelName = m.cfg.Model
 	}
 	out := doubaoChatRequest{
